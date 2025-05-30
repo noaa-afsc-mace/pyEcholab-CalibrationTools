@@ -3,8 +3,15 @@ from tkinter import filedialog
 root = tk.Tk()
 import tsCalc
 import numpy as np
+
+# For 32-bit compatibility only, can be skipped for 64-bit Python
+#import matplotlib
+#matplotlib.use('TKAgg')
+
+
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
+
 import sys
 import configparser
 from echolab2.instruments import echosounder
