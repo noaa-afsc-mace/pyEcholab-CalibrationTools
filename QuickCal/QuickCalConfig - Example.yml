@@ -1,0 +1,52 @@
+##### Configuration file for QuickCal tool #####
+
+### Global definitions ###
+
+# Output directory for calibration results
+output_directory: "D:/delme"
+
+# Full path filename of CTD data, SBE cnv or CastAway csv
+default_ctd: "G:/DY2503/calibration/CTD_data/CTD002processed.cnv"
+
+# Global sphere parameters (NOTE: channel-specific definitions override these)
+default_sphere_size: 38.1
+default_sphere_material: "Tungsten carbide"
+# +/- range around the sphere as defined per channel
+sphere_range_tolerance: 2
+# +/- TS around the calculated reference TS
+sphere_ts_tolerance: 1
+
+# Global single target detection parameters  (NOTE: channel-specific definitions override these)
+detection_parameters:
+  PLDL: 6
+  maxNormPulseLen: 20
+  minNormPulseLen: 0.1
+  maxBeamComp: 0.1
+  maxSDalong: 0.6
+  maxSDathwart: 0.6
+  min_threshold: -50
+  max_threshold: -20
+
+### Channel definitions and parameters ###
+
+channels:
+    # Channel ID
+  - id: "WBT 978217-15 ES38-7_1"
+    # Raw file(s). Use wildcards [.../*.raw'] to capture all raw files in the folder.
+    raw_files: ['//akc0ss-n086/MACE_Acoustic2/DY2503/ek80/cal_raw-fmcw_20250316/DY2503_cal-D20250316-T234513.raw','//akc0ss-n086/MACE_Acoustic2/DY2503/ek80/cal_raw-fmcw_20250316/DY2503_cal-D20250316-T235116.raw']
+    # Sphere range (m) during on-axis collection
+    sphere_range: 21
+    # Sphere size (mm)
+    sphere_size: 38.1
+    # Sphere material
+    sphere_material: "Tungsten carbide"
+    # Individual detection parameter override example:
+    detection_parameters:
+      maxBeamComp: 0.1
+  
+  - id: "WBT 978217-15 ES38-7_1"
+    # Use wildcards to capture all raw files in the folder
+    raw_files: ['//akc0ss-n086/MACE_Acoustic2/DY2503/ek80/cal_raw-fmcw_20250316/DY2503_cal-D20250316-T234513.raw','//akc0ss-n086/MACE_Acoustic2/DY2503/ek80/cal_raw-fmcw_20250316/DY2503_cal-D20250316-T235116.raw'] 
+    sphere_range: 25
+    sphere_size: 22
+    sphere_material: "Tungsten carbide"
