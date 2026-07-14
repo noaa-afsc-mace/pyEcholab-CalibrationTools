@@ -1,3 +1,4 @@
+import copy
 import os
 import re
 import warnings
@@ -16,6 +17,9 @@ import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 from glob import glob
+from matplotlib.patches import Circle
+import matplotlib.patches as patches
+from scipy import optimize
 from scipy.signal import argrelextrema
 
 # Ensure MACEFunctions are accessible
@@ -30,6 +34,52 @@ try:
     from matplotlib.pyplot import figure, show
 except ImportError as e:
     print(f"Warning: Critical dependencies missing ({e}). GUI will load but calibration will fail.")
+
+CONFIG_MODE_QUICKCAL = "quickcal"
+CONFIG_MODE_AVO = "avo"
+
+DEFAULT_AVO_SETTINGS = {
+    "temp": 5.5,
+    "salinity": 32.5,
+    "lat": 55.0,
+    "sphere_diameter": 38.1,
+    "sphere_material": "Tungsten carbide",
+    "beam_width_deg": 6.5,
+    "vessel": "Dyson",
+    "subsector_divisions": 6,
+    "min_targets_per_division": 1,
+    "sphere_depth_tolerance_m": 4.0,
+}
+
+
+def get_default_avo_settings():
+    return copy.deepcopy(DEFAULT_AVO_SETTINGS)
+
+
+def normalize_calibration_mode(value):
+    return CONFIG_MODE_AVO if str(value).strip().lower() == CONFIG_MODE_AVO else CONFIG_MODE_QUICKCAL
+
+
+def merge_avo_settings(settings):
+    merged = get_default_avo_settings()
+    if isinstance(settings, dict):
+        merged.update(settings)
+    return merged
+
+
+def expand_raw_files(files):
+    if not isinstance(files, list):
+        files = [files]
+
+    expanded_files = []
+    for file_path in files:
+        matches = glob(file_path)
+        if matches:
+            expanded_files.extend(matches)
+        else:
+            expanded_files.append(file_path)
+
+    return sorted(list(set(expanded_files)))
 
 # ==============================================================================
 #  ORIGINAL CORE CLASSES
@@ -93,20 +143,7 @@ class EchosounderCalibration:
 
     def _build_file_list(self, files):
         """Expands wildcards and ensures a sorted list of unique files."""
-        if not isinstance(files, list):
-            files = [files]
-        
-        expanded_files = []
-        for f in files:
-            # Handle wildcards (e.g., *.raw)
-            matches = glob(f)
-            if matches:
-                expanded_files.extend(matches)
-            else:
-                # Fallback if glob returns nothing (e.g., direct path not found)
-                expanded_files.append(f)
-        
-        return sorted(list(set(expanded_files)))
+        return expand_raw_files(files)
 
     def load_data(self):
         """Reads raw data and extracts calibration/angle information."""
@@ -378,6 +415,580 @@ def run_batch_calibration(config_path, do_plot=True):
     else:
         print("No results generated.")
 
+
+class AVODetectParams:
+    def __init__(self):
+        self.PLDL = 6
+        self.maxNormPulseLen = 20
+        self.minNormPulseLen = 0.1
+        self.maxBeamComp = 6
+        self.maxSDalong = 2
+        self.maxSDathwart = 2
+        self.excludeBelow = 1e10
+        self.excludeAbove = 0
+        self.threshold_min = -55
+        self.threshold_max = -30
+
+
+class AVOSingleTargets:
+    def __init__(self):
+        self.ping = np.array([])
+        self.r = np.array([])
+        self.uTS = np.array([])
+        self.cTS = np.array([])
+        self.peakAthwart = np.array([])
+        self.peakAlong = np.array([])
+        self.sdAlng = np.array([])
+        self.sdAthw = np.array([])
+        self.normWidth = np.array([])
+
+    def get_subset(self, indices):
+        subset = AVOSingleTargets()
+        for attr, value in self.__dict__.items():
+            if isinstance(value, np.ndarray):
+                setattr(subset, attr, value[indices])
+        return subset
+
+
+class TriwaveCorrect:
+    def __init__(self, start_sample, end_sample):
+        self.start_sample = start_sample
+        self.end_sample = end_sample
+
+    def triwave_correct(self, data_in):
+        sample_count = data_in.n_samples
+        ringdown = np.log10(np.mean(10 ** (data_in.power[:, self.start_sample:self.end_sample]), axis=1))
+
+        nan_indices = np.argwhere(np.isnan(ringdown))
+        while np.any(nan_indices):
+            ringdown[nan_indices] = ringdown[nan_indices - 1]
+            nan_indices = np.argwhere(np.isnan(ringdown))
+
+        inf_indices = np.argwhere(np.isinf(ringdown))
+        if len(ringdown) != len(inf_indices):
+            while np.any(inf_indices):
+                ringdown[inf_indices] = ringdown[inf_indices - 1]
+                inf_indices = np.argwhere(np.isinf(ringdown))
+
+        fit_results = self.fit_triangle(ringdown)
+        generated_triangle_offset = self.general_triangle(
+            np.arange(data_in.shape[0]),
+            A=fit_results["amplitude"],
+            M=2721.0,
+            k=fit_results["period_offset"],
+            C=0,
+            dtype="float32",
+        )
+        triangle_matrix_correct = np.array([generated_triangle_offset] * sample_count).transpose()
+        data_in.power = data_in.power - triangle_matrix_correct
+
+        return data_in, fit_results, True
+
+    def fit_triangle(self, mean_ringdown_vec, amplitude=None, period_offset=None, amplitude_offset=None):
+        sample_indices = np.arange(len(mean_ringdown_vec))
+        fit_func = lambda params: self.general_triangle(sample_indices, params[0], 2721.0, params[1], params[2])
+        err_func = lambda params: (mean_ringdown_vec - fit_func(params))
+
+        if period_offset is None:
+            period_offset = 1360 - np.argmax(mean_ringdown_vec)
+        if amplitude is None:
+            amplitude = 1.0
+        if amplitude_offset is None:
+            amplitude_offset = np.mean(mean_ringdown_vec)
+
+        fit_params, fit_cov, fit_info, fit_msg, fit_success = optimize.leastsq(
+            err_func,
+            [amplitude, period_offset, amplitude_offset],
+            full_output=True,
+        )
+
+        ss_total = sum((mean_ringdown_vec - mean_ringdown_vec.mean()) ** 2)
+        ss_error = sum(err_func(fit_params) ** 2)
+        fit_r_squared = 1 - ss_error / ss_total
+
+        fit_amplitude, fit_period_offset, fit_amplitude_offset = fit_params
+        if fit_amplitude < 0:
+            fit_amplitude = -fit_amplitude
+            fit_period_offset += 2721.0 / 2
+        fit_period_offset = fit_period_offset % 2721
+
+        if abs(fit_period_offset - 2721) < abs(fit_period_offset):
+            fit_period_offset -= 2721
+
+        return {
+            "period_offset": fit_period_offset,
+            "amplitude_offset": fit_amplitude_offset,
+            "amplitude": fit_amplitude,
+            "r_squared": fit_r_squared,
+        }
+
+    def general_triangle(self, sample_indices, A=0.5, M=2721, k=0, C=0, dtype=None):
+        phase = ((sample_indices + k) % M) / float(M)
+        triangle = A * (2 * abs(2 * (phase - np.floor(phase + 0.5))) - 1) + C
+        if dtype is not None:
+            return triangle.astype(dtype)
+        return triangle
+
+
+class AVOCalibrationSession:
+    def __init__(self, channel_id, raw_files, sphere_range, settings, output_dir):
+        self.channel_id = channel_id
+        self.raw_files = expand_raw_files(raw_files)
+        self.sphere_range = float(sphere_range)
+        self.settings = merge_avo_settings(settings)
+        self.output_dir = output_dir
+        self.figure_dir = os.path.join(output_dir, "plots")
+        os.makedirs(self.figure_dir, exist_ok=True)
+
+        self.params = AVODetectParams()
+        self.targets = AVOSingleTargets()
+        self.sphere_targets = None
+        self.ek_data = None
+        self.channel_data = None
+        self.cal = None
+        self.along = None
+        self.athwart = None
+        self.d_sv = None
+        self.d_sp = None
+        self.lat = None
+        self.frequency = None
+        self.pulse_length_us = None
+        self.sphere_depth = None
+        self.ping_day = None
+        self.triwave_corrected = False
+        self.triwave_fit_results = None
+
+    def _first_scalar(self, value):
+        arr = np.atleast_1d(value)
+        if arr.size == 0:
+            raise ValueError(f"No value available for {self.channel_id}")
+        return float(arr[0])
+
+    def _safe_filename(self):
+        return self.channel_id.replace(" ", "_").replace("-", "_").replace(":", "_")
+
+    def load_data(self):
+        print(f"Loading {len(self.raw_files)} files for AVO check: {self.channel_id}")
+        self.ek_data = echosounder.read(self.raw_files, channel_ids=[self.channel_id])
+        self.cal = echosounder.get_calibration_from_raw(self.ek_data)[self.channel_id]
+        self.channel_data = self.ek_data.get_channel_data()[self.channel_id][0]
+
+        if self._requires_triwave_correction():
+            print("  > GPT/ES80 data detected, applying triangle wave correction.")
+            self.channel_data, self.triwave_fit_results, _ = TriwaveCorrect(0, 5).triwave_correct(self.channel_data)
+            self.triwave_corrected = True
+
+        self.along, self.athwart = self.channel_data.get_physical_angles(calibration=self.cal)
+        self.d_sv = self.channel_data.get_Sv(calibration=self.cal)
+        self.d_sv.to_depth()
+        self.d_sp = self.channel_data.get_Sp(calibration=self.cal)
+
+        self.frequency = int(np.round(self._first_scalar(getattr(self.channel_data, "frequency", self.cal.frequency))))
+        self.pulse_length_us = int(np.round(self._first_scalar(self.cal.pulse_duration) * 1e6))
+        self.ping_day = np.datetime_as_string(self.d_sv.ping_time[0], unit="D")
+        self.sphere_depth = self.sphere_range + float(self.d_sv.depth[0])
+
+        try:
+            gga = self.channel_data.nmea_data.get_datagrams("GGA")["GGA"]["data"][0]
+            self.lat = float(gga.lat[:2]) + (float(gga.lat[2:]) / 60)
+        except Exception:
+            self.lat = float(self.settings["lat"])
+            print(f"  > No GPS latitude found; using AVO default latitude {self.lat}.")
+
+        if self.triwave_fit_results is not None:
+            fit_path = os.path.join(
+                self.figure_dir,
+                f"TriangleCorrection-{self.settings['vessel']}-{self.frequency}-{self.ping_day}.txt",
+            )
+            with open(fit_path, "w") as fit_file:
+                print(self.triwave_fit_results, file=fit_file)
+
+    def _requires_triwave_correction(self):
+        configuration = self.channel_data.configuration[0]
+        return (
+            configuration.get("transceiver_type") == "GPT"
+            and configuration.get("application_name") == "ES80"
+        )
+
+    def get_reference_ts(self):
+        tsbw = {
+            18000: {512: 1750, 1024: 1570},
+            38000: {512: 3280, 1024: 2430},
+            70000: {512: 4630, 1024: 2830},
+            120000: {512: 5490, 1024: 2990},
+            200000: {512: 590, 1024: 3050},
+            333000: {512: 590, 1024: 3050},
+            338000: {512: 590, 1024: 3050},
+        }
+
+        if hasattr(self.channel_data, "is_cw") and not self.channel_data.is_cw():
+            raise ValueError("AVO mode only supports CW data.")
+
+        if self.frequency not in tsbw or self.pulse_length_us not in tsbw[self.frequency]:
+            raise ValueError(
+                f"Unsupported frequency/pulse combination for AVO mode: {self.frequency} Hz, {self.pulse_length_us} us."
+            )
+
+        material = tsCalc.material_properties()[self.settings["sphere_material"]]
+        sound_speed, density = tsCalc.water_properties(
+            float(self.settings["salinity"]),
+            float(self.settings["temp"]),
+            self.sphere_depth,
+            lon=0.0,
+            lat=self.lat,
+        )
+        bandwidth = tsbw[self.frequency][self.pulse_length_us]
+        _, ts = tsCalc.freq_response(
+            self.frequency - bandwidth / 2,
+            self.frequency + bandwidth / 2,
+            float(self.settings["sphere_diameter"]) / 1000 / 2,
+            sound_speed,
+            material["c1"],
+            material["c2"],
+            density,
+            material["rho1"],
+            fstep=100,
+        )
+        return 10 * np.log10(np.mean(10 ** (ts / 10)))
+
+    def detect_targets(self):
+        for ping in range(self.d_sp.n_pings):
+            cpv = 40 * np.log10(self.d_sp.range) + 2 * self.cal.absorption_coefficient[ping] * self.d_sp.range
+            cal_power = self.d_sp.data[ping] - cpv
+            maxima = argrelextrema(cal_power, np.greater)[0]
+            pulse_term = (self._first_scalar(self.cal.sound_speed) * self._first_scalar(self.cal.pulse_duration)) / 4
+
+            for peak_index in maxima:
+                pldl_val = cal_power[peak_index] - self.params.PLDL
+                if np.where(cal_power[peak_index:] < pldl_val)[0].size > 0:
+                    right = peak_index + np.where(cal_power[peak_index:] < pldl_val)[0][0] - 1
+                else:
+                    continue
+
+                if np.where(cal_power[:peak_index] < pldl_val)[0].size > 0:
+                    left = np.where(cal_power[:peak_index] < pldl_val)[0][-1] + 1
+                else:
+                    continue
+
+                x_left = left + (pldl_val - cal_power[left]) / (cal_power[left + 1] - cal_power[left])
+                x_right = right + (pldl_val - cal_power[right]) / (cal_power[right + 1] - cal_power[right])
+                norm_width = (x_right - x_left) / 4
+                if norm_width > self.params.maxNormPulseLen or norm_width < self.params.minNormPulseLen:
+                    continue
+
+                start_index = left + 1
+                end_index = right - 1
+                if (end_index - start_index) < 1:
+                    continue
+
+                peak_along_deg = self.along.data[ping][peak_index]
+                peak_athwart_deg = self.athwart.data[ping][peak_index]
+                along_norm = 2 * peak_along_deg / self.cal.beam_width_alongship[ping]
+                athwart_norm = 2 * peak_athwart_deg / self.cal.beam_width_athwartship[ping]
+                beam_comp = 6.0206 * (
+                    along_norm ** 2 + athwart_norm ** 2 - (0.18 * along_norm ** 2 * athwart_norm ** 2)
+                )
+
+                if beam_comp > self.params.maxBeamComp:
+                    continue
+
+                along_target = self.along.data[ping][start_index:end_index]
+                athwart_target = self.athwart.data[ping][start_index:end_index]
+                sd_along = np.std(along_target)
+                sd_athwart = np.std(athwart_target)
+                if sd_along > self.params.maxSDalong or sd_athwart > self.params.maxSDathwart:
+                    continue
+
+                r_val = (
+                    sum(self.d_sp.range[start_index:end_index] * cal_power[start_index:end_index])
+                    / sum(cal_power[start_index:end_index])
+                    - pulse_term
+                )
+                if r_val > self.params.excludeBelow or r_val < self.params.excludeAbove:
+                    continue
+
+                u_ts = cal_power[peak_index] + (40 * np.log10(r_val)) + (2 * self.cal.absorption_coefficient[ping] * r_val)
+                c_ts = u_ts + beam_comp
+                if c_ts < self.params.threshold_min or c_ts > self.params.threshold_max:
+                    continue
+
+                self.targets.ping = np.append(self.targets.ping, ping)
+                self.targets.r = np.append(self.targets.r, r_val)
+                self.targets.uTS = np.append(self.targets.uTS, u_ts)
+                self.targets.cTS = np.append(self.targets.cTS, c_ts)
+                self.targets.peakAthwart = np.append(self.targets.peakAthwart, peak_athwart_deg)
+                self.targets.peakAlong = np.append(self.targets.peakAlong, peak_along_deg)
+                self.targets.sdAlng = np.append(self.targets.sdAlng, sd_along)
+                self.targets.sdAthw = np.append(self.targets.sdAthw, sd_athwart)
+                self.targets.normWidth = np.append(self.targets.normWidth, norm_width)
+
+    def save_echograms(self):
+        calview_depth = {
+            18000: 2000,
+            38000: 2000,
+            70000: 2700,
+            120000: 5000,
+            200000: 8000,
+            333000: 8000,
+            338000: 8000,
+        }
+        clean_id = self._safe_filename()
+        vessel = self.settings["vessel"]
+
+        full_indices = np.where(self.d_sv.depth <= calview_depth.get(self.frequency, self.d_sv.depth[-1]))[0]
+        if full_indices.size > 0:
+            d_sv_full = self.d_sv.view((0, -1, 1), (0, int(full_indices[-1]), 1))
+        else:
+            d_sv_full = self.d_sv
+
+        fig_full = figure(figsize=(12, 9))
+        full_echogram = echogram.Echogram(fig_full, d_sv_full, threshold=[-90, -30])
+        full_echogram.add_colorbar(fig_full)
+        plt.savefig(os.path.join(self.figure_dir, f"Echogram-{vessel}-{clean_id}-{self.ping_day}.png"))
+        plt.close(fig_full)
+
+        sphere_window = np.where(
+            np.abs(self.d_sv.depth - self.sphere_depth) < float(self.settings["sphere_depth_tolerance_m"])
+        )[0]
+        if sphere_window.size > 1:
+            d_sv_zoom = self.d_sv.view((0, -1, 1), (int(sphere_window[0]), int(sphere_window[-1]), 1))
+            fig_zoom = figure(figsize=(12, 3))
+            zoom_echogram = echogram.Echogram(fig_zoom, d_sv_zoom, threshold=[-90, -30])
+            zoom_echogram.add_colorbar(fig_zoom)
+            plt.savefig(os.path.join(self.figure_dir, f"EchogramZoom-{vessel}-{clean_id}-{self.ping_day}.png"))
+            plt.close(fig_zoom)
+
+    @staticmethod
+    def calculate_distances(range_meters, angle_athwart_deg, angle_along_deg):
+        angle_athwart_rad = np.radians(angle_athwart_deg)
+        angle_along_rad = np.radians(angle_along_deg)
+        return range_meters * np.tan(angle_athwart_rad), range_meters * np.tan(angle_along_rad)
+
+    @staticmethod
+    def find_points_in_sector(x_coords, y_coords, radius, sector_num=1):
+        x_vals = np.array(x_coords)
+        y_vals = np.array(y_coords)
+        distances = np.sqrt(x_vals ** 2 + y_vals ** 2)
+        angles_deg = (np.degrees(np.arctan2(y_vals, x_vals)) + 360) % 360
+        sector_start = (sector_num - 1) * 45
+        sector_end = sector_num * 45
+        radius_mask = distances <= radius
+        angle_mask = (angles_deg >= sector_start) & (angles_deg < sector_end)
+        combined_mask = radius_mask & angle_mask
+        return combined_mask, x_vals[combined_mask], y_vals[combined_mask]
+
+    def create_beam_plot(self):
+        beam_radius_rad = np.radians(float(self.settings["beam_width_deg"]) / 2.0)
+        beam_radius_m = np.mean(self.sphere_targets.r) * np.tan(beam_radius_rad)
+        athwart_dist, along_dist = self.calculate_distances(
+            np.mean(self.sphere_targets.r),
+            self.sphere_targets.peakAthwart,
+            self.sphere_targets.peakAlong,
+        )
+
+        subsector_divisions = int(self.settings["subsector_divisions"])
+        min_targets_per_division = float(self.settings["min_targets_per_division"])
+        sector_is_complete = []
+
+        plt.figure(figsize=(10, 7))
+        radial_bins = np.linspace(0, beam_radius_m, subsector_divisions + 1)
+        if beam_radius_m <= 0 or len(np.unique(radial_bins)) < 2:
+            radial_bins = np.array([0, 1])
+
+        for sector_num in range(1, 9):
+            mask, sector_x, sector_y = self.find_points_in_sector(
+                athwart_dist,
+                along_dist,
+                beam_radius_m,
+                sector_num=sector_num,
+            )
+            counts = np.histogram(np.sqrt(sector_x ** 2 + sector_y ** 2), bins=radial_bins)[0]
+            is_complete = not (counts < min_targets_per_division).any()
+            sector_is_complete.append(is_complete)
+            color = "darkgreen" if is_complete else "red"
+            plt.scatter(sector_x, sector_y, 5, color=color, alpha=0.5)
+            sector_start = (sector_num - 1) * 45
+            sector_end = sector_num * 45
+            sector_patch = patches.Wedge((0, 0), beam_radius_m, sector_start, sector_end, alpha=0.1, color=color)
+            plt.gca().add_patch(sector_patch)
+
+        on_axis_threshold_deg = float(self.settings["beam_width_deg"]) * 0.025
+        num_on_axis = len(
+            np.where(
+                (np.abs(self.sphere_targets.peakAthwart) < on_axis_threshold_deg)
+                & (np.abs(self.sphere_targets.peakAlong) < on_axis_threshold_deg)
+            )[0]
+        )
+        if num_on_axis < 250:
+            axis_color = "red"
+        elif num_on_axis < 500:
+            axis_color = "yellow"
+        else:
+            axis_color = "green"
+
+        axis_circle = Circle((0, 0), beam_radius_m / 10, color=axis_color, linestyle="-", linewidth=1)
+        beam_circle = Circle((0, 0), beam_radius_m, fill=False, color="k", linestyle="-", linewidth=2)
+        plt.gca().add_patch(axis_circle)
+        plt.gca().add_patch(beam_circle)
+        plt.axis("off")
+        plt.grid()
+        plt.legend(
+            handles=[
+                patches.Patch(color="red", label="Low coverage in sector"),
+                patches.Patch(color="yellow", label="Some coverage but not enough\n(on-axis only)"),
+                patches.Patch(color="green", label="Good coverage"),
+            ],
+            bbox_to_anchor=(1, 0.6),
+        )
+        plt.tight_layout()
+        plt.savefig(
+            os.path.join(
+                self.figure_dir,
+                f"TargetsInBeam-{self.settings['vessel']}-{self._safe_filename()}-{self.ping_day}.png",
+            )
+        )
+        plt.close()
+
+        if not all(sector_is_complete):
+            coverage_status = "low_sector_coverage"
+        elif num_on_axis < 250:
+            coverage_status = "low_on_axis_coverage"
+        elif num_on_axis < 500:
+            coverage_status = "partial_on_axis_coverage"
+        else:
+            coverage_status = "good"
+
+        return beam_radius_m, num_on_axis, coverage_status
+
+    def create_ts_histogram(self, ref_ts):
+        fig = plt.figure(figsize=(8, 3.5))
+        plt.subplot(111)
+        histogram = plt.hist(self.sphere_targets.cTS, bins=100)
+        plt.title("Single target detections in the specified range\nRed region is expected sphere TS")
+        plt.fill_betweenx([0, np.max(histogram[0]) * 1.05], ref_ts - 1.5, ref_ts + 1.5, color="red", alpha=0.5)
+        plt.ylim(0, np.max(histogram[0]) * 1.05)
+        plt.grid()
+        plt.savefig(
+            os.path.join(
+                self.figure_dir,
+                f"TargetTS-{self.settings['vessel']}-{self._safe_filename()}-{self.ping_day}.png",
+            )
+        )
+        plt.close(fig)
+
+    def run_check(self, do_plot=True):
+        self.load_data()
+        ref_ts = self.get_reference_ts()
+        self.params.excludeAbove = self.sphere_range - float(self.settings["sphere_depth_tolerance_m"])
+        self.params.excludeBelow = self.sphere_range + float(self.settings["sphere_depth_tolerance_m"])
+
+        if do_plot:
+            self.save_echograms()
+
+        print(f"Running AVO coverage check for {self.channel_id} at {self.frequency / 1000:.0f} kHz")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self.detect_targets()
+
+        sphere_hits = np.where(
+            np.abs(self.targets.r - self.sphere_range) < (float(self.settings["sphere_depth_tolerance_m"]) / 2.0)
+        )
+        self.sphere_targets = self.targets.get_subset(sphere_hits)
+
+        result = {
+            "channel_id": self.channel_id,
+            "frequency_hz": self.frequency,
+            "sphere_range_m": self.sphere_range,
+            "reference_ts": ref_ts,
+            "sphere_hit_count": int(len(self.sphere_targets.ping)),
+            "on_axis_hit_count": 0,
+            "coverage_status": "no_sphere_hits",
+            "triwave_corrected": self.triwave_corrected,
+            "files_used": ", ".join(self.raw_files),
+        }
+
+        if len(self.sphere_targets.ping) == 0:
+            print(f"  > No sphere hits were detected for {self.channel_id}.")
+            return result
+
+        result["mean_detected_range_m"] = float(np.mean(self.sphere_targets.r))
+        result["mean_detected_ts_db"] = float(np.mean(self.sphere_targets.cTS))
+        result["ts_std_db"] = float(np.std(self.sphere_targets.cTS))
+
+        if do_plot:
+            beam_radius_m, on_axis_hit_count, coverage_status = self.create_beam_plot()
+            self.create_ts_histogram(ref_ts)
+        else:
+            beam_radius_m = np.mean(self.sphere_targets.r) * np.tan(np.radians(float(self.settings["beam_width_deg"]) / 2.0))
+            on_axis_threshold_deg = float(self.settings["beam_width_deg"]) * 0.025
+            on_axis_hit_count = len(
+                np.where(
+                    (np.abs(self.sphere_targets.peakAthwart) < on_axis_threshold_deg)
+                    & (np.abs(self.sphere_targets.peakAlong) < on_axis_threshold_deg)
+                )[0]
+            )
+            coverage_status = "good"
+
+        result["beam_radius_m"] = float(beam_radius_m)
+        result["on_axis_hit_count"] = int(on_axis_hit_count)
+        result["coverage_status"] = coverage_status
+        print(
+            f"  > {self.channel_id}: {result['sphere_hit_count']} sphere hits, "
+            f"{result['on_axis_hit_count']} on-axis hits, status={coverage_status}"
+        )
+        return result
+
+
+def run_avo_batch_calibration(config_path, do_plot=True):
+    if not os.path.exists(config_path):
+        print(f"Error: {config_path} not found.")
+        return
+
+    with open(config_path, "r") as config_file:
+        config = yaml.safe_load(config_file) or {}
+
+    base_dir = os.path.join(config.get("output_directory", "./cal_results"), "avo_output")
+    os.makedirs(base_dir, exist_ok=True)
+
+    avo_settings = merge_avo_settings(config.get("avo_settings", {}))
+    all_results = []
+    channels = config.get("channels", []) or []
+
+    for channel in channels:
+        channel_id = channel.get("id")
+        if not channel_id:
+            print("FAILED <unknown>: channel id is required.")
+            continue
+
+        try:
+            session = AVOCalibrationSession(
+                channel_id=channel_id,
+                raw_files=channel["raw_files"],
+                sphere_range=channel["sphere_range"],
+                settings=avo_settings,
+                output_dir=base_dir,
+            )
+            all_results.append(session.run_check(do_plot=do_plot))
+        except Exception as exc:
+            print(f"FAILED {channel_id}: {exc}")
+            import traceback
+            traceback.print_exc()
+            all_results.append(
+                {
+                    "channel_id": channel_id,
+                    "coverage_status": "failed",
+                    "error": str(exc),
+                    "files_used": ", ".join(channel.get("raw_files", [])),
+                }
+            )
+
+    if all_results:
+        summary_path = os.path.join(base_dir, "AVOCheckSummary.csv")
+        pd.DataFrame(all_results).to_csv(summary_path, index=False)
+        print(f"Complete, see {summary_path} for AVO results.")
+    else:
+        print("No AVO results generated.")
+
 # ==============================================================================
 #  GUI CLASSES
 # ==============================================================================
@@ -400,8 +1011,12 @@ class TextRedirector(object):
 class QuickCalGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("QuickCal - Echosounder Calibration")
+        self.root.title("QuickCal / AVO - Echosounder Calibration")
         self.root.geometry("900x800")
+        self.calibration_mode = CONFIG_MODE_QUICKCAL
+        self.avo_settings = get_default_avo_settings()
+        self.mode_label_var = tk.StringVar(value="Mode: QuickCal")
+        self.quickcal_only_widgets = []
 
         # Variables for Global Settings
         self.output_dir = tk.StringVar()
@@ -425,6 +1040,7 @@ class QuickCalGUI:
         self.channels = [] # List of dictionaries
 
         self.create_widgets()
+        self.apply_mode_state()
 
     def create_widgets(self):
         # Top Toolbar (Load/Save)
@@ -432,6 +1048,7 @@ class QuickCalGUI:
         top_frame.pack(fill=tk.X)
         ttk.Button(top_frame, text="Load Config (YAML)", command=self.load_yaml).pack(side=tk.LEFT, padx=5)
         ttk.Button(top_frame, text="Save Config (YAML)", command=self.save_yaml_as).pack(side=tk.LEFT, padx=5)
+        ttk.Label(top_frame, textvariable=self.mode_label_var).pack(side=tk.LEFT, padx=10)
         ttk.Button(top_frame, text="RUN CALIBRATION", command=self.run_calibration_thread).pack(side=tk.RIGHT, padx=5)
 
         # Main Scrollable Area
@@ -454,21 +1071,30 @@ class QuickCalGUI:
         f1.pack(fill=tk.X, padx=10, pady=5)
         
         self.create_file_entry(f1, "Output Directory:", self.output_dir, True)
-        self.create_file_entry(f1, "CTD File:", self.ctd_file, False)
+        ctd_controls = self.create_file_entry(f1, "CTD File:", self.ctd_file, False)
+        self.quickcal_only_widgets.extend([ctd_controls["entry"], ctd_controls["button"]])
         
         grid_f1 = ttk.Frame(f1)
         grid_f1.pack(fill=tk.X, pady=5)
         ttk.Label(grid_f1, text="Default Sphere Size (mm):").grid(row=0, column=0, sticky="e")
-        ttk.Entry(grid_f1, textvariable=self.sphere_size, width=10).grid(row=0, column=1, sticky="w", padx=5)
+        sphere_size_entry = ttk.Entry(grid_f1, textvariable=self.sphere_size, width=10)
+        sphere_size_entry.grid(row=0, column=1, sticky="w", padx=5)
+        self.quickcal_only_widgets.append(sphere_size_entry)
         
         ttk.Label(grid_f1, text="Sphere Material:").grid(row=0, column=2, sticky="e")
-        ttk.Entry(grid_f1, textvariable=self.sphere_mat, width=20).grid(row=0, column=3, sticky="w", padx=5)
+        sphere_mat_entry = ttk.Entry(grid_f1, textvariable=self.sphere_mat, width=20)
+        sphere_mat_entry.grid(row=0, column=3, sticky="w", padx=5)
+        self.quickcal_only_widgets.append(sphere_mat_entry)
 
         ttk.Label(grid_f1, text="Range Tolerance (m):").grid(row=1, column=0, sticky="e")
-        ttk.Entry(grid_f1, textvariable=self.range_tol, width=10).grid(row=1, column=1, sticky="w", padx=5)
+        range_tol_entry = ttk.Entry(grid_f1, textvariable=self.range_tol, width=10)
+        range_tol_entry.grid(row=1, column=1, sticky="w", padx=5)
+        self.quickcal_only_widgets.append(range_tol_entry)
 
         ttk.Label(grid_f1, text="TS Tolerance (dB):").grid(row=1, column=2, sticky="e")
-        ttk.Entry(grid_f1, textvariable=self.ts_tol, width=10).grid(row=1, column=3, sticky="w", padx=5)
+        ts_tol_entry = ttk.Entry(grid_f1, textvariable=self.ts_tol, width=10)
+        ts_tol_entry.grid(row=1, column=3, sticky="w", padx=5)
+        self.quickcal_only_widgets.append(ts_tol_entry)
 
         # --- Section 2: Global Detection Parameters ---
         f2 = ttk.LabelFrame(scrollable_frame, text="Global Detection Parameters", padding="10")
@@ -488,7 +1114,9 @@ class QuickCalGUI:
         for i, (label, var) in enumerate(params):
             r, c = divmod(i, 4)
             ttk.Label(f2, text=label+":").grid(row=r, column=c*2, sticky="e", padx=5, pady=2)
-            ttk.Entry(f2, textvariable=var, width=8).grid(row=r, column=c*2+1, sticky="w", padx=5, pady=2)
+            entry = ttk.Entry(f2, textvariable=var, width=8)
+            entry.grid(row=r, column=c*2+1, sticky="w", padx=5, pady=2)
+            self.quickcal_only_widgets.append(entry)
 
         # --- Section 3: Channels ---
         f3 = ttk.LabelFrame(scrollable_frame, text="Channels (Double-click to edit)", padding="10")
@@ -520,8 +1148,10 @@ class QuickCalGUI:
     def create_file_entry(self, parent, label, var, is_dir=False):
         frame = ttk.Frame(parent)
         frame.pack(fill=tk.X, pady=2)
-        ttk.Label(frame, text=label, width=15, anchor="e").pack(side=tk.LEFT)
-        ttk.Entry(frame, textvariable=var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        label_widget = ttk.Label(frame, text=label, width=15, anchor="e")
+        label_widget.pack(side=tk.LEFT)
+        entry = ttk.Entry(frame, textvariable=var)
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         
         def browse():
             if is_dir:
@@ -531,7 +1161,19 @@ class QuickCalGUI:
             if path:
                 var.set(path)
                 
-        ttk.Button(frame, text="Browse", command=browse).pack(side=tk.LEFT)
+        button = ttk.Button(frame, text="Browse", command=browse)
+        button.pack(side=tk.LEFT)
+        return {"frame": frame, "label": label_widget, "entry": entry, "button": button}
+
+    def update_mode_label(self):
+        mode_name = "AVO" if self.calibration_mode == CONFIG_MODE_AVO else "QuickCal"
+        self.mode_label_var.set(f"Mode: {mode_name}")
+
+    def apply_mode_state(self):
+        self.update_mode_label()
+        widget_state = "disabled" if self.calibration_mode == CONFIG_MODE_AVO else "normal"
+        for widget in self.quickcal_only_widgets:
+            widget.configure(state=widget_state)
 
     # --- Channel Management ---
     
@@ -543,10 +1185,11 @@ class QuickCalGUI:
             
             # Helper text for display
             extra = ""
-            if ch.get('min_ts') and ch.get('max_ts'):
-                extra = f" | TS: {ch.get('min_ts')} to {ch.get('max_ts')} dB"
-            elif ch.get('sphere_ts_tolerance'):
-                extra = f" | TS Tol: {ch.get('sphere_ts_tolerance')} dB"
+            if self.calibration_mode != CONFIG_MODE_AVO:
+                if ch.get('min_ts') and ch.get('max_ts'):
+                    extra = f" | TS: {ch.get('min_ts')} to {ch.get('max_ts')} dB"
+                elif ch.get('sphere_ts_tolerance'):
+                    extra = f" | TS Tol: {ch.get('sphere_ts_tolerance')} dB"
 
             txt = f"{ch.get('id', 'Unknown')} | Range: {s_range}m | Files: {files_count}{extra}"
             self.channel_listbox.insert(tk.END, txt)
@@ -560,10 +1203,11 @@ class QuickCalGUI:
     def open_channel_popup(self, index=None):
         is_edit = (index is not None)
         title = "Edit Channel" if is_edit else "Add Channel"
+        is_avo_mode = self.calibration_mode == CONFIG_MODE_AVO
         
         popup = tk.Toplevel(self.root)
         popup.title(title)
-        popup.geometry("500x550")
+        popup.geometry("500x480" if is_avo_mode else "500x550")
         
         # Initialize Variables
         c_id = tk.StringVar()
@@ -606,29 +1250,29 @@ class QuickCalGUI:
 
         ttk.Label(info_frame, text="Sphere Range (m):").grid(row=1, column=0, sticky="e")
         ttk.Entry(info_frame, textvariable=c_range, width=15).grid(row=1, column=1, sticky="w", padx=5)
-        
-        ttk.Label(info_frame, text="Sphere Size (mm):").grid(row=2, column=0, sticky="e")
-        ttk.Entry(info_frame, textvariable=c_size, width=15).grid(row=2, column=1, sticky="w", padx=5)
-        ttk.Label(info_frame, text="(0 = Use Global)").grid(row=2, column=2, sticky="w")
 
-        ttk.Label(info_frame, text="Sphere Material:").grid(row=3, column=0, sticky="e")
-        ttk.Entry(info_frame, textvariable=c_mat, width=15).grid(row=3, column=1, sticky="w", padx=5)
-        ttk.Label(info_frame, text="(Empty = Use Global)").grid(row=3, column=2, sticky="w")
+        if not is_avo_mode:
+            ttk.Label(info_frame, text="Sphere Size (mm):").grid(row=2, column=0, sticky="e")
+            ttk.Entry(info_frame, textvariable=c_size, width=15).grid(row=2, column=1, sticky="w", padx=5)
+            ttk.Label(info_frame, text="(0 = Use Global)").grid(row=2, column=2, sticky="w")
 
-        # TS Filtering
-        ts_frame = ttk.LabelFrame(popup, text="TS Filtering Overrides (Leave empty to use Global defaults)", padding=10)
-        ts_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        ttk.Label(ts_frame, text="TS Tolerance (+/- dB):").grid(row=0, column=0, sticky="e")
-        ttk.Entry(ts_frame, textvariable=c_ts_tol, width=10).grid(row=0, column=1, sticky="w", padx=5)
+            ttk.Label(info_frame, text="Sphere Material:").grid(row=3, column=0, sticky="e")
+            ttk.Entry(info_frame, textvariable=c_mat, width=15).grid(row=3, column=1, sticky="w", padx=5)
+            ttk.Label(info_frame, text="(Empty = Use Global)").grid(row=3, column=2, sticky="w")
 
-        ttk.Label(ts_frame, text="OR Explicit Range (Overrides Tolerance):", font='TkDefaultFont 9 bold').grid(row=1, column=0, columnspan=2, sticky="w", pady=(5,2))
-        
-        ttk.Label(ts_frame, text="Min TS (dB):").grid(row=2, column=0, sticky="e")
-        ttk.Entry(ts_frame, textvariable=c_min_ts, width=10).grid(row=2, column=1, sticky="w", padx=5)
-        
-        ttk.Label(ts_frame, text="Max TS (dB):").grid(row=2, column=2, sticky="e")
-        ttk.Entry(ts_frame, textvariable=c_max_ts, width=10).grid(row=2, column=3, sticky="w", padx=5)
+            ts_frame = ttk.LabelFrame(popup, text="TS Filtering Overrides (Leave empty to use Global defaults)", padding=10)
+            ts_frame.pack(fill=tk.X, padx=10, pady=5)
+
+            ttk.Label(ts_frame, text="TS Tolerance (+/- dB):").grid(row=0, column=0, sticky="e")
+            ttk.Entry(ts_frame, textvariable=c_ts_tol, width=10).grid(row=0, column=1, sticky="w", padx=5)
+
+            ttk.Label(ts_frame, text="OR Explicit Range (Overrides Tolerance):", font='TkDefaultFont 9 bold').grid(row=1, column=0, columnspan=2, sticky="w", pady=(5,2))
+
+            ttk.Label(ts_frame, text="Min TS (dB):").grid(row=2, column=0, sticky="e")
+            ttk.Entry(ts_frame, textvariable=c_min_ts, width=10).grid(row=2, column=1, sticky="w", padx=5)
+
+            ttk.Label(ts_frame, text="Max TS (dB):").grid(row=2, column=2, sticky="e")
+            ttk.Entry(ts_frame, textvariable=c_max_ts, width=10).grid(row=2, column=3, sticky="w", padx=5)
 
         # Files Listbox
         f_frame = ttk.LabelFrame(popup, text="Raw Files")
@@ -671,22 +1315,22 @@ class QuickCalGUI:
                 'raw_files': files_list,
                 'sphere_range': c_range.get()
             }
-            if c_size.get() > 0:
-                ch_data['sphere_size'] = c_size.get()
-            if c_mat.get():
-                ch_data['sphere_material'] = c_mat.get()
-            
-            # Save TS parameters if present
-            try:
-                if c_ts_tol.get().strip():
-                    ch_data['sphere_ts_tolerance'] = float(c_ts_tol.get())
-                if c_min_ts.get().strip():
-                    ch_data['min_ts'] = float(c_min_ts.get())
-                if c_max_ts.get().strip():
-                    ch_data['max_ts'] = float(c_max_ts.get())
-            except ValueError:
-                messagebox.showerror("Error", "TS parameters must be numeric")
-                return
+            if not is_avo_mode:
+                if c_size.get() > 0:
+                    ch_data['sphere_size'] = c_size.get()
+                if c_mat.get():
+                    ch_data['sphere_material'] = c_mat.get()
+
+                try:
+                    if c_ts_tol.get().strip():
+                        ch_data['sphere_ts_tolerance'] = float(c_ts_tol.get())
+                    if c_min_ts.get().strip():
+                        ch_data['min_ts'] = float(c_min_ts.get())
+                    if c_max_ts.get().strip():
+                        ch_data['max_ts'] = float(c_max_ts.get())
+                except ValueError:
+                    messagebox.showerror("Error", "TS parameters must be numeric")
+                    return
 
             if is_edit:
                 self.channels[index] = ch_data
@@ -717,6 +1361,8 @@ class QuickCalGUI:
 
     def generate_config_dict(self):
         config = {
+            'calibration_mode': self.calibration_mode,
+            'avo_settings': copy.deepcopy(self.avo_settings),
             'output_directory': self.output_dir.get(),
             'default_ctd': self.ctd_file.get(),
             'default_sphere_size': self.sphere_size.get(),
@@ -743,7 +1389,10 @@ class QuickCalGUI:
         
         try:
             with open(path, 'r') as f:
-                config = yaml.safe_load(f)
+                config = yaml.safe_load(f) or {}
+
+            self.calibration_mode = normalize_calibration_mode(config.get('calibration_mode'))
+            self.avo_settings = merge_avo_settings(config.get('avo_settings', {}))
             
             self.output_dir.set(config.get('output_directory', ''))
             self.ctd_file.set(config.get('default_ctd', ''))
@@ -762,9 +1411,10 @@ class QuickCalGUI:
             self.det_min_thresh.set(dp.get('min_threshold', -50))
             self.det_max_thresh.set(dp.get('max_threshold', -20))
             
-            self.channels = config.get('channels', [])
+            self.channels = config.get('channels', []) or []
+            self.apply_mode_state()
             self.refresh_channel_list()
-            print(f"Loaded configuration from {path}")
+            print(f"Loaded configuration from {path} ({self.calibration_mode})")
             
         except Exception as e:
             messagebox.showerror("Load Error", str(e))
@@ -787,7 +1437,7 @@ class QuickCalGUI:
             messagebox.showwarning("Warning", "No channels defined.")
             return
 
-        temp_path = os.path.join(os.getcwd(), "_gui_temp_config.yaml")
+        temp_path = os.path.join(os.getcwd(), "_gui_temp_config_avo.yaml")
         with open(temp_path, 'w') as f:
             yaml.dump(config, f)
             
@@ -798,7 +1448,14 @@ class QuickCalGUI:
     def run_logic(self, config_path):
         print("--- Starting Calibration ---")
         try:
-            run_batch_calibration(config_path, do_plot=True)
+            with open(config_path, 'r') as config_file:
+                config = yaml.safe_load(config_file) or {}
+
+            mode = normalize_calibration_mode(config.get('calibration_mode'))
+            if mode == CONFIG_MODE_AVO:
+                run_avo_batch_calibration(config_path, do_plot=True)
+            else:
+                run_batch_calibration(config_path, do_plot=True)
             print("--- Calibration Finished ---")
         except Exception as e:
             print(f"FATAL ERROR: {e}")

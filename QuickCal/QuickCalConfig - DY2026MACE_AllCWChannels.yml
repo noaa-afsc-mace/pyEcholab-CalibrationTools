@@ -8,10 +8,10 @@
 ### Global definitions ###
 
 # Output directory for calibration results
-output_directory: "G:/DY2600 - gear trials/calibration/QuickCal"
+output_directory: "D:/Projects/Broadband/Multi_CW/MCWCalibration_2601"
 
 # Full path filename of CTD data, SBE cnv or CastAway csv
-default_ctd: "G:/DY2600 - gear trials/calibration/CTD_data/CalibrationCTDprocessed.cnv"
+default_ctd: "G:/DY2601/calibration/CTD_data/CTD001processed.cnv"
 
 # Global sphere parameters (NOTE: channel-specific definitions override these)
 default_sphere_size: 38.1
@@ -19,7 +19,7 @@ default_sphere_material: "Tungsten carbide"
 # +/- range around the sphere as defined per channel
 sphere_range_tolerance: 1
 # +/- TS around the calculated reference TS
-sphere_ts_tolerance: 1
+sphere_ts_tolerance: 8
 
 # Global single target detection parameters  (NOTE: channel-specific definitions override these)
 detection_parameters:
@@ -38,81 +38,97 @@ channels:
     # Channel ID
   - id: "WBT 998500-15 ES18-11mk2_1" # Nominal 18
     # Raw file(s). Use wildcards [.../*.raw'] to capture all raw files in the folder.
-    raw_files: ['D:/Data/DY2600/ek80/raw/DY2600-cal-*T05*.raw']
+    raw_files: ['D:/Projects/Broadband/Multi_CW/MCWCalibration_2601/Split/*.raw']
     # Sphere range (m) during on-axis collection
-    sphere_range: 19.7
+    sphere_range: 17.4
     # Sphere size (mm)
     sphere_size: 38.1
     # Sphere material
     
-  # - id: "WBT 998500-15 ES18-11mk2_5" # 18 Low
-    # raw_files: ['xxxx,'xxxx']
-    # sphere_range: XX
-    # sphere_size: 38.1
+  - id: "WBT 998500-15 ES18-11mk2_5" # 18 Low
+    raw_files: ['D:/Projects/Broadband/Multi_CW/MCWCalibration_2601/Split/*.raw']
+    sphere_range: 17.4
+    sphere_size: 38.1
     
-  # - id: "WBT 998500-15 ES18-11mk2_7" # 18 High
-    # raw_files: ['xxxx,'xxxx']
-    # sphere_range: XX
-    # sphere_size: 38.1
+  - id: "WBT 998500-15 ES18-11mk2_7" # 18 High
+    raw_files: ['D:/Projects/Broadband/Multi_CW/MCWCalibration_2601/Split/*.raw']
+    sphere_range: 17.4
+    sphere_size: 38.1
   
   - id: "WBT 978217-15 ES38-7_1" # Nominal 38
-    raw_files: ['D:/Data/DY2600/ek80/raw/DY2600-cal-*T05*.raw']
-    sphere_range: 19.4
+    raw_files: ['D:/Projects/Broadband/Multi_CW/MCWCalibration_2601/Split/*.raw']
+    sphere_range: 17.5
     sphere_size: 38.1
 
-  # - id: "WBT 978217-15 ES38-7_5" # 38 Low
-    # raw_files: ['xxxx,'xxxx']
-    # sphere_range: XX
-    # sphere_size: 38.1
+  - id: "WBT 978217-15 ES38-7_5" # 38 Low
+    raw_files: ['D:/Projects/Broadband/Multi_CW/MCWCalibration_2601/Split/*.raw']
+    sphere_range: 17.5
+    sphere_size: 38.1
 
-  # - id: "WBT 978217-15 ES38-7_7" # 38 High
-    # raw_files: ['xxxx,'xxxx']
-    # sphere_range: XX
-    # sphere_size: 38.1    
+  - id: "WBT 978217-15 ES38-7_7" # 38 High
+    raw_files: ['D:/Projects/Broadband/Multi_CW/MCWCalibration_2601/Split/*.raw']
+    sphere_range: 17.5
+    sphere_size: 38.1    
     
   - id: "WBT 978213-15 ES70-7C_1" # Nominal 70
-    raw_files: ['D:/Data/DY2600/ek80/raw/DY2600-cal-*T05*.raw','D:/Data/DY2600/ek80/raw/DY2600-cal-*T06*.raw']
-    sphere_range: 19.9
+    raw_files: ['D:/Projects/Broadband/Multi_CW/MCWCalibration_2601/Split/*.raw']
+    sphere_range: 17.7
     sphere_size: 38.1
 
-  # - id: "WBT 978213-15 ES70-7C_5" # 70 Low
-    # raw_files: ['xxxx,'xxxx']
-    # sphere_range: XX
-    # sphere_size: 38.1
+  - id: "WBT 978213-15 ES70-7C_5" # 70 Low
+    raw_files: ['D:/Projects/Broadband/Multi_CW/MCWCalibration_2601/Split/*.raw']
+    sphere_range: 17.7
+    sphere_size: 38.1
 
-  # - id: "WBT 978213-15 ES70-7C_7" # 70 High
-    # raw_files: ['xxxx,'xxxx']
-    # sphere_range: XX
-    # sphere_size: 38.1    
+  - id: "WBT 978213-15 ES70-7C_7" # 70 High
+    raw_files: ['D:/Projects/Broadband/Multi_CW/MCWCalibration_2601/Split/*.raw']
+    sphere_range: 17.7
+    sphere_size: 38.1    
 
   - id: "WBT 976714-15 ES120-7C_1" # Nominal 120
-    raw_files: ['D:/Data/DY2600/ek80/raw/DY2600-cal-*T06*.raw']
-    sphere_range: 20
+    raw_files: ['D:/Projects/Broadband/Multi_CW/MCWCalibration_2601/Split/*.raw']
+    sphere_range: 17.7
     sphere_size: 38.1
     sphere_ts_tolerance: 8
 
-  # - id: "WBT 976714-15 ES120-7C_5" # 120 Low
-    # raw_files: ['xxxx,'xxxx']
-    # sphere_range: XX
-    # sphere_size: 38.1
+  - id: "WBT 976714-15 ES120-7C_5" # 120 Low
+    raw_files: ['D:/Projects/Broadband/Multi_CW/MCWCalibration_2601/Split/*.raw']
+    sphere_range: 17.7
+    sphere_size: 38.1
 
-  # - id: "WBT 976714-15 ES120-7C_7" # 120 High
-    # raw_files: ['xxxx,'xxxx']
-    # sphere_range: XX
-    # sphere_size: 38.1  
+  - id: "WBT 976714-15 ES120-7C_7" # 120 High
+    raw_files: ['D:/Projects/Broadband/Multi_CW/MCWCalibration_2601/Split/*.raw']
+    sphere_range: 17.7
+    sphere_size: 38.1  
     
   - id: "WBT 978208-15 ES200-7C_1" # Nominal 200
-    raw_files: ['D:/Data/DY2600/ek80/raw/DY2600-cal-*T06*.raw']
-    sphere_range: 19.2
+    raw_files: ['D:/Projects/Broadband/Multi_CW/MCWCalibration_2601/Split/*T02*.raw']
+    sphere_range: 17.2
     sphere_size: 38.1
     sphere_ts_tolerance: 8
 
-  # - id: "WBT 978208-15 ES200-7C_5" # 200 Low
-    # raw_files: ['xxxx,'xxxx']
-    # sphere_range: XX
-    # sphere_size: 38.1
+  - id: "WBT 978208-15 ES200-7C_5" # 200 Low
+    raw_files: ['D:/Projects/Broadband/Multi_CW/MCWCalibration_2601/Split/*T02*.raw']
+    sphere_range: 22.1
+    sphere_size: 22
 
-  # - id: "WBT 978208-15 ES200-7C_7" # 200 High
-    # raw_files: ['xxxx,'xxxx']
-    # sphere_range: XX
-    # sphere_size: 38.1  
+  - id: "WBT 978208-15 ES200-7C_7" # 200 High
+    raw_files: ['D:/Projects/Broadband/Multi_CW/MCWCalibration_2601/Split/*T02*.raw']
+    sphere_range: 17.2
+    sphere_size: 38.1  
+
+  #- id: "WBT 976726-15 ES333-7C_1" # Nominal 338
+   # raw_files: ['D:/Projects/Broadband/Multi_CW/MCWCalibration_2601/Split/*.raw']
+   # sphere_range: 22.9
+   # sphere_size: 22
+   # sphere_ts_tolerance: 8
+
+  #- id: "WBT 976726-15 ES333-7C_5" # 333 Low
+   # raw_files: ['D:/Projects/Broadband/Multi_CW/MCWCalibration_2601/Split/*.raw']
+   # sphere_range: 22.9
+   # sphere_size: 22
+
+  #- id: "WBT 976726-15 ES333-7C_7" # 333 High
+    #raw_files: ['D:/Projects/Broadband/Multi_CW/MCWCalibration_2601/Split/*.raw']
+    #sphere_range: 22.9
+    #sphere_size: 22

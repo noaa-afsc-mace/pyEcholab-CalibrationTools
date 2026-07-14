@@ -1,0 +1,39 @@
+##### Configuration file for QuickCalGui_AVO in AVO mode #####
+
+# Top-level mode flag: when set to "avo", the GUI runs the integrated
+# AVO coverage-check workflow instead of the full QuickCal calibration path.
+calibration_mode: "avo"
+
+### Output definitions ###
+
+# AVO figures and summary CSV will be written under:
+#   <output_directory>/avo_output/
+# This replaces figure_folder from AVO.ini.
+output_directory: "D:/delme"
+
+### Hidden AVO settings migrated from AVO.ini ###
+
+avo_settings:
+  temp: 5.5
+  salinity: 32.5
+  lat: 55.0
+  sphere_diameter: 38.1
+  sphere_material: "Tungsten carbide"
+  beam_width_deg: 6.5
+  vessel: "Dyson"
+  subsector_divisions: 6
+  min_targets_per_division: 1
+
+### Channel definitions ###
+
+channels:
+  - id: "WBT 978217-15 ES38-7_1"
+    raw_files:
+      - "D:/path/to/calibration/file_001.raw"
+      - "D:/path/to/calibration/file_002.raw"
+    sphere_range: 21.0
+
+  - id: "WBT 976714-15 ES120-7C_1"
+    raw_files:
+      - "D:/path/to/another/calibration/*.raw"
+    sphere_range: 17.7

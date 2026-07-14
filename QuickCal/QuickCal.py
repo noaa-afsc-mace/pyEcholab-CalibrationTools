@@ -1,3 +1,9 @@
+'''
+pyhton
+import QuickCal
+ QuickCal.run_batch_calibration('D:\\MACE-repos\\pyEcholab-CalibrationTools\\QuickCal\\config.yml')
+ '''
+
 import os
 import re
 import warnings
@@ -97,8 +103,10 @@ class EchosounderCalibration:
         print(f"Loading {len(self.raw_files)} files for channel {self.channel_id}...")
         self.ek_data = echosounder.read(self.raw_files, channel_ids=[self.channel_id])
         self.cal = echosounder.get_calibration_from_raw(self.ek_data)[self.channel_id]
+        print(self.cal.frequency)
         
         chan_obj = self.ek_data.get_channel_data()[self.channel_id][0]
+        print(chan_obj.frequency)
         self.along, self.athwart = chan_obj.get_physical_angles(calibration=self.cal)
         
         gga = chan_obj.nmea_data.get_datagrams('GGA')['GGA']['data'][0]
@@ -109,13 +117,16 @@ class EchosounderCalibration:
         self.d_sp = echosounder.get_Sp(self.ek_data)[self.channel_id]
 
     def get_reference_ts(self):
-        tsbw = {18000:{512:1750,1024:1570}, 38000:{512:3280,1024:2430}, 
-                70000:{512:4630,1024:2830}, 120000:{512:5490,1024:2990}, 
-                200000:{512:590,1024:3050}, 333000:{512:590,1024:3050}}
+        tsbw = {14000:{512:1750,1024:1570}, 18000:{512:1750,1024:1570}, 22000:{512:1750,1024:1570},
+                35000:{512:3280,1024:2430}, 38000:{512:3280,1024:2430}, 44000:{512:3280,1024:2430}, 
+                57000:{512:4630,1024:2830}, 70000:{512:4630,1024:2830}, 82000:{512:4630,1024:2830},
+                98000:{512:5490,1024:2990}, 120000:{512:5490,1024:2990}, 148000:{512:5490,1024:2990}, 
+                169000:{512:5490,1024:3050}, 200000:{512:5490,1024:3050}, 230000:{512:5490,1024:3050},
+                395000:{512:5490,1024:3050}, 338000:{512:5490,1024:3050}, 440000:{512:5490,1024:3050}}
         
         ext = self.ctd_file.split('.')[-1].lower()
         if ext == 'cnv':
-            df = ctd.from_cnv(self.ctd_file)[['t090C','sal00']].rename(columns={"t090C": "temp", "sal00": "sal"})
+            df = ctd.from_cnv(self.ctd_file)[['tv290C','sal00']].rename(columns={"tv290C": "temp", "sal00": "sal"})
             df['depth'] = gsw.z_from_p(df.index, 50)
             df = df.reset_index()
         else:
@@ -130,6 +141,7 @@ class EchosounderCalibration:
                                          sphere_env.depth.values, lon=0.0, lat=self.lat)
         
         f = int(self.cal.frequency)
+        print(f)
         pl = int(np.round(self.cal.pulse_duration * 1e6))
         bw = tsbw[f][pl]
         
