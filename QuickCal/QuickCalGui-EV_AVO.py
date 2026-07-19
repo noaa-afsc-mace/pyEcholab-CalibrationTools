@@ -1,5 +1,6 @@
 import copy
 import io
+import json
 import os
 import re
 import warnings
@@ -184,6 +185,290 @@ def merge_avo_settings(settings):
     if isinstance(settings, dict):
         merged.update(settings)
     return merged
+
+
+def _yaml_scalar(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _yaml_single_quoted(value):
+    text = str(value).replace("'", "''")
+    return f"'{text}'"
+
+
+def _format_inline_list(values, quoted=False):
+    formatter = _yaml_single_quoted if quoted else _yaml_scalar
+    return "[" + ", ".join(formatter(value) for value in values) + "]"
+
+
+QUICKCAL_DETECTION_PARAMETER_COMMENTS = {
+    "PLDL": "Pulse length determination level (dB below the pulse peak).",
+    "maxNormPulseLen": "Maximum normalized pulse length allowed for accepted targets.",
+    "minNormPulseLen": "Minimum normalized pulse length allowed for accepted targets.",
+    "maxBeamComp": "Maximum beam compensation value allowed for accepted targets.",
+    "maxSDalong": "Maximum alongship angle standard deviation for accepted targets.",
+    "maxSDathwart": "Maximum athwartship angle standard deviation for accepted targets.",
+    "min_threshold": "Minimum target strength (dB) retained during target detection.",
+    "max_threshold": "Maximum target strength (dB) retained during target detection.",
+}
+
+
+AVO_SETTINGS_COMMENTS = {
+    "temp": "Representative seawater temperature in degrees Celsius.",
+    "salinity": "Representative seawater salinity in PSU.",
+    "lat": "Latitude in decimal degrees used for seawater property calculations.",
+    "sphere_diameter": "Calibration sphere diameter in millimeters.",
+    "sphere_material": "Calibration sphere material name used by the AVO workflow.",
+    "beam_width_deg": "Nominal transducer beam width in degrees.",
+    "vessel": "Vessel name used to label AVO outputs.",
+    "subsector_divisions": "Number of angular subsectors used for beam coverage checks.",
+    "min_targets_per_division": "Minimum accepted targets required in each subsector.",
+    "sphere_depth_tolerance_m": "Allowed +/- depth window around sphere_range in meters.",
+}
+
+
+def _format_block_mapping(mapping, indent=2):
+    lines = []
+    pad = " " * indent
+    for key, value in mapping.items():
+        lines.append(f"{pad}{key}: {_yaml_scalar(value)}")
+    return lines
+
+
+def _append_comment(lines, comment, indent=0):
+    lines.append(f'{" " * indent}# {comment}')
+
+
+def _append_commented_scalar(lines, key, value, comment, indent=0):
+    _append_comment(lines, comment, indent=indent)
+    lines.append(f'{" " * indent}{key}: {_yaml_scalar(value)}')
+
+
+def _append_commented_list_item_scalar(lines, key, value, comment, indent=2):
+    _append_comment(lines, comment, indent=indent)
+    lines.append(f'{" " * indent}- {key}: {_yaml_scalar(value)}')
+
+
+def _append_commented_inline_list(lines, key, values, comment, indent=0, quoted=False):
+    _append_comment(lines, comment, indent=indent)
+    lines.append(f'{" " * indent}{key}: {_format_inline_list(values or [], quoted=quoted)}')
+
+
+def _append_commented_block_mapping(lines, key, mapping, header_comment, field_comments, indent=0):
+    _append_comment(lines, header_comment, indent=indent)
+    lines.append(f'{" " * indent}{key}:')
+    for field_key, field_value in (mapping or {}).items():
+        _append_commented_scalar(
+            lines,
+            field_key,
+            field_value,
+            field_comments.get(field_key, f"Value for {field_key}."),
+            indent=indent + 2,
+        )
+
+
+def _append_commented_block_list(lines, key, values, comment, indent=0):
+    _append_comment(lines, comment, indent=indent)
+    lines.append(f'{" " * indent}{key}:')
+    for value in values or []:
+        lines.append(f'{" " * (indent + 2)}- {_yaml_scalar(value)}')
+
+
+def _format_channel_block(channel, include_avo_settings):
+    if include_avo_settings:
+        lines = []
+        _append_commented_list_item_scalar(lines, "id", channel.get("id", ""), "Channel ID.", indent=2)
+        _append_commented_block_list(
+            lines,
+            "raw_files",
+            channel.get("raw_files", []),
+            "Raw file(s) or wildcard patterns used for this channel.",
+            indent=4,
+        )
+        _append_commented_scalar(
+            lines,
+            "sphere_range",
+            channel.get("sphere_range", ""),
+            "Sphere range in meters during on-axis collection.",
+            indent=4,
+        )
+        return lines
+
+    lines = []
+    _append_commented_list_item_scalar(lines, "id", channel.get("id", ""), "Channel ID.", indent=2)
+    _append_commented_inline_list(
+        lines,
+        "raw_files",
+        channel.get("raw_files", []),
+        "Raw file(s). Use wildcards like [.../*.raw] to capture all files in a folder.",
+        indent=4,
+        quoted=True,
+    )
+    _append_commented_scalar(
+        lines,
+        "sphere_range",
+        channel.get("sphere_range", ""),
+        "Sphere range in meters during on-axis collection.",
+        indent=4,
+    )
+
+    if channel.get("sphere_size") not in (None, ""):
+        _append_commented_scalar(lines, "sphere_size", channel.get("sphere_size"), "Sphere size in millimeters.", indent=4)
+    if channel.get("sphere_material"):
+        _append_commented_scalar(
+            lines,
+            "sphere_material",
+            channel.get("sphere_material"),
+            "Sphere material used to calculate the reference target strength.",
+            indent=4,
+        )
+    if channel.get("sphere_ts_tolerance") not in (None, ""):
+        _append_commented_scalar(
+            lines,
+            "sphere_ts_tolerance",
+            channel.get("sphere_ts_tolerance"),
+            "Allowed +/- target strength window around the calculated reference TS.",
+            indent=4,
+        )
+    if channel.get("min_ts") not in (None, ""):
+        _append_commented_scalar(lines, "min_ts", channel.get("min_ts"), "Explicit minimum target strength override in dB.", indent=4)
+    if channel.get("max_ts") not in (None, ""):
+        _append_commented_scalar(lines, "max_ts", channel.get("max_ts"), "Explicit maximum target strength override in dB.", indent=4)
+    det_params = channel.get("detection_parameters") or {}
+    if det_params:
+        _append_commented_block_mapping(
+            lines,
+            "detection_parameters",
+            det_params,
+            "Channel-specific single target detection parameter overrides.",
+            QUICKCAL_DETECTION_PARAMETER_COMMENTS,
+            indent=4,
+        )
+    return lines
+
+
+def format_saved_config_yaml(config):
+    if normalize_calibration_mode(config.get("calibration_mode")) == CONFIG_MODE_AVO:
+        lines = [
+            "##### Configuration file for QuickCalGui_AVO in AVO mode #####",
+            "",
+        ]
+        _append_commented_scalar(
+            lines,
+            "calibration_mode",
+            CONFIG_MODE_AVO,
+            'Set to "avo" to run the integrated AVO coverage-check workflow.',
+        )
+        lines.extend([
+            "",
+            "### Output definitions ###",
+            "",
+        ])
+        _append_commented_scalar(
+            lines,
+            "output_directory",
+            config.get("output_directory", ""),
+            "Base folder where AVO figures and summary files will be written.",
+        )
+        lines.extend([
+            "",
+            "### Hidden AVO settings migrated from AVO.ini ###",
+            "",
+        ])
+        _append_commented_block_mapping(
+            lines,
+            "avo_settings",
+            merge_avo_settings(config.get("avo_settings", {})),
+            "AVO-only settings migrated from AVO.ini.",
+            AVO_SETTINGS_COMMENTS,
+        )
+        lines.extend([
+            "",
+            "### Channel definitions ###",
+            "",
+            "channels:",
+        ])
+        channels = config.get("channels", []) or []
+        if channels:
+            for channel in channels:
+                lines.extend(_format_channel_block(channel, include_avo_settings=True))
+                lines.append("")
+            lines.pop()
+        return "\n".join(lines) + "\n"
+
+    lines = [
+        "##### Configuration file for QuickCal tool #####",
+        "",
+        "# Before using this file, set the CTD file, channel sphere ranges, and raw file paths.",
+        "",
+        "### Global definitions ###",
+        "",
+    ]
+    _append_commented_scalar(
+        lines,
+        "output_directory",
+        config.get("output_directory", ""),
+        "Output directory for calibration results.",
+    )
+    lines.append("")
+    _append_commented_scalar(
+        lines,
+        "default_ctd",
+        config.get("default_ctd", ""),
+        "Full path to the CTD file (Sea-Bird .cnv or CastAway .csv).",
+    )
+    lines.append("")
+    _append_commented_scalar(
+        lines,
+        "default_sphere_size",
+        config.get("default_sphere_size", 38.1),
+        "Default sphere size in millimeters; channel-specific values override this.",
+    )
+    _append_commented_scalar(
+        lines,
+        "default_sphere_material",
+        config.get("default_sphere_material", "Tungsten carbide"),
+        "Default sphere material; channel-specific values override this.",
+    )
+    _append_commented_scalar(
+        lines,
+        "sphere_range_tolerance",
+        config.get("sphere_range_tolerance", 1),
+        "Allowed +/- range around each channel's sphere_range, in meters.",
+    )
+    _append_commented_scalar(
+        lines,
+        "sphere_ts_tolerance",
+        config.get("sphere_ts_tolerance", 1),
+        "Allowed +/- target strength window around the calculated reference TS.",
+    )
+    lines.append("")
+    _append_commented_block_mapping(
+        lines,
+        "detection_parameters",
+        config.get("detection_parameters", {}),
+        "Global single target detection parameters; channel-specific overrides win.",
+        QUICKCAL_DETECTION_PARAMETER_COMMENTS,
+    )
+    lines.extend([
+        "",
+        "### Channel definitions and parameters ###",
+        "",
+        "channels:",
+    ])
+    channels = config.get("channels", []) or []
+    if channels:
+        for channel in channels:
+            lines.extend(_format_channel_block(channel, include_avo_settings=False))
+            lines.append("")
+        lines.pop()
+    return "\n".join(lines) + "\n"
 
 
 def expand_raw_files(files):
@@ -707,7 +992,7 @@ def run_batch_calibration(config_path, do_plot=True):
 
         try:
             with open(yaml_path, 'w') as file_handle:
-                yaml.dump(config, file_handle, default_flow_style=False)
+                yaml.safe_dump(config, file_handle, sort_keys=False, default_flow_style=False)
             print(f"Configuration saved to {yaml_path}")
         except Exception as e:
             print(f"Error saving configuration: {e}")
@@ -1926,17 +2211,8 @@ class QuickCalGUI:
 
     def generate_config_dict(self):
         config = {
-            'calibration_mode': self.calibration_mode,
-            'avo_settings': copy.deepcopy(self.avo_settings),
             'output_directory': self.output_dir.get(),
             'default_ctd': self.ctd_file.get(),
-            'bad_data_regions_file': self.bad_data_regions_file.get(),
-            'environment_settings': {
-                'manual_env': self.manual_env.get(),
-                'manual_temp': self.manual_temp.get(),
-                'manual_sal': self.manual_sal.get(),
-                'manual_c': self.manual_c.get(),
-            },
             'default_sphere_size': self.sphere_size.get(),
             'default_sphere_material': self.sphere_mat.get(),
             'sphere_range_tolerance': self.range_tol.get(),
@@ -1953,6 +2229,13 @@ class QuickCalGUI:
             },
             'channels': self.channels
         }
+        if self.calibration_mode == CONFIG_MODE_AVO:
+            config = {
+                'calibration_mode': CONFIG_MODE_AVO,
+                'output_directory': self.output_dir.get(),
+                'avo_settings': copy.deepcopy(self.avo_settings),
+                'channels': self.channels,
+            }
         return config
 
     def load_yaml(self):
@@ -2006,7 +2289,7 @@ class QuickCalGUI:
         try:
             config = self.generate_config_dict()
             with open(path, 'w') as f:
-                yaml.dump(config, f, default_flow_style=False)
+                f.write(format_saved_config_yaml(config))
             print(f"Saved configuration to {path}")
         except Exception as e:
             messagebox.showerror("Save Error", str(e))
@@ -2020,7 +2303,7 @@ class QuickCalGUI:
 
         temp_path = os.path.join(os.getcwd(), "_gui_temp_config_ev_avo.yaml")
         with open(temp_path, 'w') as f:
-            yaml.dump(config, f)
+            yaml.safe_dump(config, f, sort_keys=False, default_flow_style=False)
             
         # Run in thread to keep GUI responsive
         t = threading.Thread(target=self.run_logic, args=(temp_path,))
