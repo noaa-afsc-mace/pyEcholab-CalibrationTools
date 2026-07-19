@@ -207,6 +207,32 @@ def _format_inline_list(values, quoted=False):
     return "[" + ", ".join(formatter(value) for value in values) + "]"
 
 
+QUICKCAL_DETECTION_PARAMETER_COMMENTS = {
+    "PLDL": "Pulse length determination level (dB below the pulse peak).",
+    "maxNormPulseLen": "Maximum normalized pulse length allowed for accepted targets.",
+    "minNormPulseLen": "Minimum normalized pulse length allowed for accepted targets.",
+    "maxBeamComp": "Maximum beam compensation value allowed for accepted targets.",
+    "maxSDalong": "Maximum alongship angle standard deviation for accepted targets.",
+    "maxSDathwart": "Maximum athwartship angle standard deviation for accepted targets.",
+    "min_threshold": "Minimum target strength (dB) retained during target detection.",
+    "max_threshold": "Maximum target strength (dB) retained during target detection.",
+}
+
+
+AVO_SETTINGS_COMMENTS = {
+    "temp": "Representative seawater temperature in degrees Celsius.",
+    "salinity": "Representative seawater salinity in PSU.",
+    "lat": "Latitude in decimal degrees used for seawater property calculations.",
+    "sphere_diameter": "Calibration sphere diameter in millimeters.",
+    "sphere_material": "Calibration sphere material name used by the AVO workflow.",
+    "beam_width_deg": "Nominal transducer beam width in degrees.",
+    "vessel": "Vessel name used to label AVO outputs.",
+    "subsector_divisions": "Number of angular subsectors used for beam coverage checks.",
+    "min_targets_per_division": "Minimum accepted targets required in each subsector.",
+    "sphere_depth_tolerance_m": "Allowed +/- depth window around sphere_range in meters.",
+}
+
+
 def _format_block_mapping(mapping, indent=2):
     lines = []
     pad = " " * indent
@@ -215,43 +241,115 @@ def _format_block_mapping(mapping, indent=2):
     return lines
 
 
+def _append_comment(lines, comment, indent=0):
+    lines.append(f'{" " * indent}# {comment}')
+
+
+def _append_commented_scalar(lines, key, value, comment, indent=0):
+    _append_comment(lines, comment, indent=indent)
+    lines.append(f'{" " * indent}{key}: {_yaml_scalar(value)}')
+
+
+def _append_commented_list_item_scalar(lines, key, value, comment, indent=2):
+    _append_comment(lines, comment, indent=indent)
+    lines.append(f'{" " * indent}- {key}: {_yaml_scalar(value)}')
+
+
+def _append_commented_inline_list(lines, key, values, comment, indent=0, quoted=False):
+    _append_comment(lines, comment, indent=indent)
+    lines.append(f'{" " * indent}{key}: {_format_inline_list(values or [], quoted=quoted)}')
+
+
+def _append_commented_block_mapping(lines, key, mapping, header_comment, field_comments, indent=0):
+    _append_comment(lines, header_comment, indent=indent)
+    lines.append(f'{" " * indent}{key}:')
+    for field_key, field_value in (mapping or {}).items():
+        _append_commented_scalar(
+            lines,
+            field_key,
+            field_value,
+            field_comments.get(field_key, f"Value for {field_key}."),
+            indent=indent + 2,
+        )
+
+
+def _append_commented_block_list(lines, key, values, comment, indent=0):
+    _append_comment(lines, comment, indent=indent)
+    lines.append(f'{" " * indent}{key}:')
+    for value in values or []:
+        lines.append(f'{" " * (indent + 2)}- {_yaml_scalar(value)}')
+
+
 def _format_channel_block(channel, include_avo_settings):
     if include_avo_settings:
-        lines = [f"  - id: {_yaml_scalar(channel.get('id', ''))}", "    raw_files:"]
-        for raw_file in channel.get("raw_files", []) or []:
-            lines.append(f"      - {_yaml_scalar(raw_file)}")
-        lines.append(f"    sphere_range: {_yaml_scalar(channel.get('sphere_range', ''))}")
+        lines = []
+        _append_commented_list_item_scalar(lines, "id", channel.get("id", ""), "Channel ID.", indent=2)
+        _append_commented_block_list(
+            lines,
+            "raw_files",
+            channel.get("raw_files", []),
+            "Raw file(s) or wildcard patterns used for this channel.",
+            indent=4,
+        )
+        _append_commented_scalar(
+            lines,
+            "sphere_range",
+            channel.get("sphere_range", ""),
+            "Sphere range in meters during on-axis collection.",
+            indent=4,
+        )
         return lines
 
-    lines = ["    # Channel ID", f"  - id: {_yaml_scalar(channel.get('id', ''))}"]
-    lines.append(
-        "    # Raw file(s). Use wildcards [.../*.raw'] to capture all raw files in the folder."
+    lines = []
+    _append_commented_list_item_scalar(lines, "id", channel.get("id", ""), "Channel ID.", indent=2)
+    _append_commented_inline_list(
+        lines,
+        "raw_files",
+        channel.get("raw_files", []),
+        "Raw file(s). Use wildcards like [.../*.raw] to capture all files in a folder.",
+        indent=4,
+        quoted=True,
     )
-    lines.append(f"    raw_files: {_format_inline_list(channel.get('raw_files', []), quoted=True)}")
-    lines.append("    # Sphere range (m) during on-axis collection")
-    lines.append(f"    sphere_range: {_yaml_scalar(channel.get('sphere_range', ''))}")
+    _append_commented_scalar(
+        lines,
+        "sphere_range",
+        channel.get("sphere_range", ""),
+        "Sphere range in meters during on-axis collection.",
+        indent=4,
+    )
 
     if channel.get("sphere_size") not in (None, ""):
-        lines.append("    # Sphere size (mm)")
-        lines.append(f"    sphere_size: {_yaml_scalar(channel.get('sphere_size'))}")
+        _append_commented_scalar(lines, "sphere_size", channel.get("sphere_size"), "Sphere size in millimeters.", indent=4)
     if channel.get("sphere_material"):
-        lines.append("    # Sphere material")
-        lines.append(f"    sphere_material: {_yaml_scalar(channel.get('sphere_material'))}")
+        _append_commented_scalar(
+            lines,
+            "sphere_material",
+            channel.get("sphere_material"),
+            "Sphere material used to calculate the reference target strength.",
+            indent=4,
+        )
     if channel.get("sphere_ts_tolerance") not in (None, ""):
-        lines.append("    # +/- TS around the calculated reference TS")
-        lines.append(f"    sphere_ts_tolerance: {_yaml_scalar(channel.get('sphere_ts_tolerance'))}")
+        _append_commented_scalar(
+            lines,
+            "sphere_ts_tolerance",
+            channel.get("sphere_ts_tolerance"),
+            "Allowed +/- target strength window around the calculated reference TS.",
+            indent=4,
+        )
     if channel.get("min_ts") not in (None, ""):
-        lines.append("    # Explicit TS range override")
-        lines.append(f"    min_ts: {_yaml_scalar(channel.get('min_ts'))}")
+        _append_commented_scalar(lines, "min_ts", channel.get("min_ts"), "Explicit minimum target strength override in dB.", indent=4)
     if channel.get("max_ts") not in (None, ""):
-        if channel.get("min_ts") in (None, ""):
-            lines.append("    # Explicit TS range override")
-        lines.append(f"    max_ts: {_yaml_scalar(channel.get('max_ts'))}")
+        _append_commented_scalar(lines, "max_ts", channel.get("max_ts"), "Explicit maximum target strength override in dB.", indent=4)
     det_params = channel.get("detection_parameters") or {}
     if det_params:
-        lines.append("    # Individual detection parameter override example:")
-        lines.append("    detection_parameters:")
-        lines.extend(_format_block_mapping(det_params, indent=6))
+        _append_commented_block_mapping(
+            lines,
+            "detection_parameters",
+            det_params,
+            "Channel-specific single target detection parameter overrides.",
+            QUICKCAL_DETECTION_PARAMETER_COMMENTS,
+            indent=4,
+        )
     return lines
 
 
@@ -260,22 +358,36 @@ def format_saved_config_yaml(config):
         lines = [
             "##### Configuration file for QuickCalGui_AVO in AVO mode #####",
             "",
-            '# Top-level mode flag: when set to "avo", the GUI runs the integrated',
-            "# AVO coverage-check workflow instead of the full QuickCal calibration path.",
-            'calibration_mode: "avo"',
+        ]
+        _append_commented_scalar(
+            lines,
+            "calibration_mode",
+            CONFIG_MODE_AVO,
+            'Set to "avo" to run the integrated AVO coverage-check workflow.',
+        )
+        lines.extend([
             "",
             "### Output definitions ###",
             "",
-            "# AVO figures and summary CSV will be written under:",
-            "#   <output_directory>/avo_output/",
-            "# This replaces figure_folder from AVO.ini.",
-            f'output_directory: {_yaml_scalar(config.get("output_directory", ""))}',
+        ])
+        _append_commented_scalar(
+            lines,
+            "output_directory",
+            config.get("output_directory", ""),
+            "Base folder where AVO figures and summary files will be written.",
+        )
+        lines.extend([
             "",
             "### Hidden AVO settings migrated from AVO.ini ###",
             "",
-            "avo_settings:",
-        ]
-        lines.extend(_format_block_mapping(merge_avo_settings(config.get("avo_settings", {})), indent=2))
+        ])
+        _append_commented_block_mapping(
+            lines,
+            "avo_settings",
+            merge_avo_settings(config.get("avo_settings", {})),
+            "AVO-only settings migrated from AVO.ini.",
+            AVO_SETTINGS_COMMENTS,
+        )
         lines.extend([
             "",
             "### Channel definitions ###",
@@ -293,26 +405,57 @@ def format_saved_config_yaml(config):
     lines = [
         "##### Configuration file for QuickCal tool #####",
         "",
+        "# Before using this file, set the CTD file, channel sphere ranges, and raw file paths.",
+        "",
         "### Global definitions ###",
         "",
-        "# Output directory for calibration results",
-        f'output_directory: {_yaml_scalar(config.get("output_directory", ""))}',
-        "",
-        "# Full path filename of CTD data, SBE cnv or CastAway csv",
-        f'default_ctd: {_yaml_scalar(config.get("default_ctd", ""))}',
-        "",
-        "# Global sphere parameters (NOTE: channel-specific definitions override these)",
-        f'default_sphere_size: {_yaml_scalar(config.get("default_sphere_size", 38.1))}',
-        f'default_sphere_material: {_yaml_scalar(config.get("default_sphere_material", "Tungsten carbide"))}',
-        "# +/- range around the sphere as defined per channel",
-        f'sphere_range_tolerance: {_yaml_scalar(config.get("sphere_range_tolerance", 1))}',
-        "# +/- TS around the calculated reference TS",
-        f'sphere_ts_tolerance: {_yaml_scalar(config.get("sphere_ts_tolerance", 1))}',
-        "",
-        "# Global single target detection parameters  (NOTE: channel-specific definitions override these)",
-        "detection_parameters:",
     ]
-    lines.extend(_format_block_mapping(config.get("detection_parameters", {}), indent=2))
+    _append_commented_scalar(
+        lines,
+        "output_directory",
+        config.get("output_directory", ""),
+        "Output directory for calibration results.",
+    )
+    lines.append("")
+    _append_commented_scalar(
+        lines,
+        "default_ctd",
+        config.get("default_ctd", ""),
+        "Full path to the CTD file (Sea-Bird .cnv or CastAway .csv).",
+    )
+    lines.append("")
+    _append_commented_scalar(
+        lines,
+        "default_sphere_size",
+        config.get("default_sphere_size", 38.1),
+        "Default sphere size in millimeters; channel-specific values override this.",
+    )
+    _append_commented_scalar(
+        lines,
+        "default_sphere_material",
+        config.get("default_sphere_material", "Tungsten carbide"),
+        "Default sphere material; channel-specific values override this.",
+    )
+    _append_commented_scalar(
+        lines,
+        "sphere_range_tolerance",
+        config.get("sphere_range_tolerance", 1),
+        "Allowed +/- range around each channel's sphere_range, in meters.",
+    )
+    _append_commented_scalar(
+        lines,
+        "sphere_ts_tolerance",
+        config.get("sphere_ts_tolerance", 1),
+        "Allowed +/- target strength window around the calculated reference TS.",
+    )
+    lines.append("")
+    _append_commented_block_mapping(
+        lines,
+        "detection_parameters",
+        config.get("detection_parameters", {}),
+        "Global single target detection parameters; channel-specific overrides win.",
+        QUICKCAL_DETECTION_PARAMETER_COMMENTS,
+    )
     lines.extend([
         "",
         "### Channel definitions and parameters ###",
