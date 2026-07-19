@@ -1,5 +1,6 @@
 import copy
 import io
+import json
 import os
 import re
 import warnings
@@ -184,6 +185,147 @@ def merge_avo_settings(settings):
     if isinstance(settings, dict):
         merged.update(settings)
     return merged
+
+
+def _yaml_scalar(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _yaml_single_quoted(value):
+    text = str(value).replace("'", "''")
+    return f"'{text}'"
+
+
+def _format_inline_list(values, quoted=False):
+    formatter = _yaml_single_quoted if quoted else _yaml_scalar
+    return "[" + ", ".join(formatter(value) for value in values) + "]"
+
+
+def _format_block_mapping(mapping, indent=2):
+    lines = []
+    pad = " " * indent
+    for key, value in mapping.items():
+        lines.append(f"{pad}{key}: {_yaml_scalar(value)}")
+    return lines
+
+
+def _format_channel_block(channel, include_avo_settings):
+    if include_avo_settings:
+        lines = [f"  - id: {_yaml_scalar(channel.get('id', ''))}", "    raw_files:"]
+        for raw_file in channel.get("raw_files", []) or []:
+            lines.append(f"      - {_yaml_scalar(raw_file)}")
+        lines.append(f"    sphere_range: {_yaml_scalar(channel.get('sphere_range', ''))}")
+        return lines
+
+    lines = ["    # Channel ID", f"  - id: {_yaml_scalar(channel.get('id', ''))}"]
+    lines.append(
+        "    # Raw file(s). Use wildcards [.../*.raw'] to capture all raw files in the folder."
+    )
+    lines.append(f"    raw_files: {_format_inline_list(channel.get('raw_files', []), quoted=True)}")
+    lines.append("    # Sphere range (m) during on-axis collection")
+    lines.append(f"    sphere_range: {_yaml_scalar(channel.get('sphere_range', ''))}")
+
+    if channel.get("sphere_size") not in (None, ""):
+        lines.append("    # Sphere size (mm)")
+        lines.append(f"    sphere_size: {_yaml_scalar(channel.get('sphere_size'))}")
+    if channel.get("sphere_material"):
+        lines.append("    # Sphere material")
+        lines.append(f"    sphere_material: {_yaml_scalar(channel.get('sphere_material'))}")
+    if channel.get("sphere_ts_tolerance") not in (None, ""):
+        lines.append("    # +/- TS around the calculated reference TS")
+        lines.append(f"    sphere_ts_tolerance: {_yaml_scalar(channel.get('sphere_ts_tolerance'))}")
+    if channel.get("min_ts") not in (None, ""):
+        lines.append("    # Explicit TS range override")
+        lines.append(f"    min_ts: {_yaml_scalar(channel.get('min_ts'))}")
+    if channel.get("max_ts") not in (None, ""):
+        if channel.get("min_ts") in (None, ""):
+            lines.append("    # Explicit TS range override")
+        lines.append(f"    max_ts: {_yaml_scalar(channel.get('max_ts'))}")
+    det_params = channel.get("detection_parameters") or {}
+    if det_params:
+        lines.append("    # Individual detection parameter override example:")
+        lines.append("    detection_parameters:")
+        lines.extend(_format_block_mapping(det_params, indent=6))
+    return lines
+
+
+def format_saved_config_yaml(config):
+    if normalize_calibration_mode(config.get("calibration_mode")) == CONFIG_MODE_AVO:
+        lines = [
+            "##### Configuration file for QuickCalGui_AVO in AVO mode #####",
+            "",
+            '# Top-level mode flag: when set to "avo", the GUI runs the integrated',
+            "# AVO coverage-check workflow instead of the full QuickCal calibration path.",
+            'calibration_mode: "avo"',
+            "",
+            "### Output definitions ###",
+            "",
+            "# AVO figures and summary CSV will be written under:",
+            "#   <output_directory>/avo_output/",
+            "# This replaces figure_folder from AVO.ini.",
+            f'output_directory: {_yaml_scalar(config.get("output_directory", ""))}',
+            "",
+            "### Hidden AVO settings migrated from AVO.ini ###",
+            "",
+            "avo_settings:",
+        ]
+        lines.extend(_format_block_mapping(merge_avo_settings(config.get("avo_settings", {})), indent=2))
+        lines.extend([
+            "",
+            "### Channel definitions ###",
+            "",
+            "channels:",
+        ])
+        channels = config.get("channels", []) or []
+        if channels:
+            for channel in channels:
+                lines.extend(_format_channel_block(channel, include_avo_settings=True))
+                lines.append("")
+            lines.pop()
+        return "\n".join(lines) + "\n"
+
+    lines = [
+        "##### Configuration file for QuickCal tool #####",
+        "",
+        "### Global definitions ###",
+        "",
+        "# Output directory for calibration results",
+        f'output_directory: {_yaml_scalar(config.get("output_directory", ""))}',
+        "",
+        "# Full path filename of CTD data, SBE cnv or CastAway csv",
+        f'default_ctd: {_yaml_scalar(config.get("default_ctd", ""))}',
+        "",
+        "# Global sphere parameters (NOTE: channel-specific definitions override these)",
+        f'default_sphere_size: {_yaml_scalar(config.get("default_sphere_size", 38.1))}',
+        f'default_sphere_material: {_yaml_scalar(config.get("default_sphere_material", "Tungsten carbide"))}',
+        "# +/- range around the sphere as defined per channel",
+        f'sphere_range_tolerance: {_yaml_scalar(config.get("sphere_range_tolerance", 1))}',
+        "# +/- TS around the calculated reference TS",
+        f'sphere_ts_tolerance: {_yaml_scalar(config.get("sphere_ts_tolerance", 1))}',
+        "",
+        "# Global single target detection parameters  (NOTE: channel-specific definitions override these)",
+        "detection_parameters:",
+    ]
+    lines.extend(_format_block_mapping(config.get("detection_parameters", {}), indent=2))
+    lines.extend([
+        "",
+        "### Channel definitions and parameters ###",
+        "",
+        "channels:",
+    ])
+    channels = config.get("channels", []) or []
+    if channels:
+        for channel in channels:
+            lines.extend(_format_channel_block(channel, include_avo_settings=False))
+            lines.append("")
+        lines.pop()
+    return "\n".join(lines) + "\n"
 
 
 def expand_raw_files(files):
@@ -707,7 +849,7 @@ def run_batch_calibration(config_path, do_plot=True):
 
         try:
             with open(yaml_path, 'w') as file_handle:
-                yaml.dump(config, file_handle, default_flow_style=False)
+                yaml.safe_dump(config, file_handle, sort_keys=False, default_flow_style=False)
             print(f"Configuration saved to {yaml_path}")
         except Exception as e:
             print(f"Error saving configuration: {e}")
@@ -1926,17 +2068,8 @@ class QuickCalGUI:
 
     def generate_config_dict(self):
         config = {
-            'calibration_mode': self.calibration_mode,
-            'avo_settings': copy.deepcopy(self.avo_settings),
             'output_directory': self.output_dir.get(),
             'default_ctd': self.ctd_file.get(),
-            'bad_data_regions_file': self.bad_data_regions_file.get(),
-            'environment_settings': {
-                'manual_env': self.manual_env.get(),
-                'manual_temp': self.manual_temp.get(),
-                'manual_sal': self.manual_sal.get(),
-                'manual_c': self.manual_c.get(),
-            },
             'default_sphere_size': self.sphere_size.get(),
             'default_sphere_material': self.sphere_mat.get(),
             'sphere_range_tolerance': self.range_tol.get(),
@@ -1953,6 +2086,13 @@ class QuickCalGUI:
             },
             'channels': self.channels
         }
+        if self.calibration_mode == CONFIG_MODE_AVO:
+            config = {
+                'calibration_mode': CONFIG_MODE_AVO,
+                'output_directory': self.output_dir.get(),
+                'avo_settings': copy.deepcopy(self.avo_settings),
+                'channels': self.channels,
+            }
         return config
 
     def load_yaml(self):
@@ -2006,7 +2146,7 @@ class QuickCalGUI:
         try:
             config = self.generate_config_dict()
             with open(path, 'w') as f:
-                yaml.dump(config, f, default_flow_style=False)
+                f.write(format_saved_config_yaml(config))
             print(f"Saved configuration to {path}")
         except Exception as e:
             messagebox.showerror("Save Error", str(e))
@@ -2020,7 +2160,7 @@ class QuickCalGUI:
 
         temp_path = os.path.join(os.getcwd(), "_gui_temp_config_ev_avo.yaml")
         with open(temp_path, 'w') as f:
-            yaml.dump(config, f)
+            yaml.safe_dump(config, f, sort_keys=False, default_flow_style=False)
             
         # Run in thread to keep GUI responsive
         t = threading.Thread(target=self.run_logic, args=(temp_path,))
