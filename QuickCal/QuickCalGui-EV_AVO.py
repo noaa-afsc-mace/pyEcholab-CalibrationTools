@@ -54,6 +54,119 @@ DEFAULT_AVO_SETTINGS = {
 }
 
 
+TS_BANDWIDTH_PULSE_LENGTHS_US = [64, 128, 256, 512, 1024, 2048, 4096]
+
+TS_BANDWIDTH_TABLE_KHZ = {
+    18:  {64: np.nan, 128: np.nan, 256: np.nan, 512: 1.75,  1024: 1.57, 2048: 1.19, 4096: 0.72},
+    38:  {64: np.nan, 128: np.nan, 256: 3.68,   512: 3.28,  1024: 2.43, 2048: 1.45, 4096: 0.77},
+    70:  {64: 6.93,   128: 6.74,   256: 6.09,   512: 4.63,  1024: 2.83, 2048: 1.51, 4096: np.nan},
+    120: {64: 11.66,  128: 10.79,  256: 8.61,   512: 5.49,  1024: 2.99, 2048: 1.53, 4096: np.nan},
+    200: {64: 18.54,  128: 15.55,  256: 10.51,  512: 5.9,   1024: 3.05, 2048: np.nan, 4096: np.nan},
+    333: {64: np.nan, 128: np.nan, 256: np.nan, 512: 1.96,  1024: 0.98, 2048: np.nan, 4096: np.nan},
+}
+
+
+def _ts_bandwidth_from_channel_name(channel_id, pulse_duration=None, frequency=None):
+    """
+    Return the configured TS bandwidth in Hz for a channel name and pulse duration.
+
+    The bandwidth values (in kHz) are looked up from the combination of frequency
+    and pulse duration (in microseconds). Where the table value is NaN (or for
+    unsupported combinations), 1 / pulse_duration of the calibration object is used.
+
+    Parameters
+    ----------
+    channel_id : str
+        Channel identifier string (e.g. 'WBT 998500-15 ES18_1' or '38 kHz').
+    pulse_duration : float or None
+        Pulse duration in seconds (e.g. 0.001024) or microseconds (e.g. 1024).
+    frequency : float or None
+        Transducer frequency in Hz (e.g. 18000) or kHz (e.g. 18).
+
+    Returns
+    -------
+    float
+        Bandwidth in Hz.
+    """
+    # 1. Identify frequency (in kHz)
+    channel_khz = None
+    if frequency is not None:
+        try:
+            f_val = float(_scalar_at(frequency)) if hasattr(frequency, '__len__') or isinstance(frequency, np.ndarray) else float(frequency)
+            if f_val > 1000:
+                f_val /= 1000.0
+            closest_f = min(TS_BANDWIDTH_TABLE_KHZ.keys(), key=lambda k: abs(k - f_val))
+            if abs(closest_f - f_val) < 5.0:
+                channel_khz = closest_f
+        except Exception:
+            pass
+
+    if channel_khz is None:
+        channel_name = str(channel_id)
+        for khz in TS_BANDWIDTH_TABLE_KHZ.keys():
+            pattern = rf"(?<!\d){khz}(?:\.0+)?\s*(?:k(?:hz)?)?(?!\d)"
+            if re.search(pattern, channel_name, flags=re.IGNORECASE):
+                channel_khz = khz
+                break
+
+    # 2. Identify pulse duration (seconds and microseconds)
+    pulse_duration_sec = None
+    pulse_len_us = None
+    if pulse_duration is not None:
+        try:
+            p_val = float(_scalar_at(pulse_duration)) if hasattr(pulse_duration, '__len__') or isinstance(pulse_duration, np.ndarray) else float(pulse_duration)
+            if p_val > 0:
+                if p_val < 0.1:  # Value is in seconds
+                    pulse_duration_sec = p_val
+                    pulse_len_us = p_val * 1e6
+                else:  # Value is in microseconds
+                    pulse_len_us = p_val
+                    pulse_duration_sec = p_val / 1e6
+        except Exception:
+            pass
+
+    # 3. Lookup in table if frequency and pulse duration are recognized
+    if channel_khz in TS_BANDWIDTH_TABLE_KHZ and pulse_len_us is not None:
+        closest_col = min(TS_BANDWIDTH_PULSE_LENGTHS_US, key=lambda c: abs(c - pulse_len_us))
+        if abs(closest_col - pulse_len_us) / closest_col <= 0.10:
+            table_val = TS_BANDWIDTH_TABLE_KHZ[channel_khz].get(closest_col)
+            if table_val is not None and not np.isnan(table_val):
+                bw_hz = float(table_val) * 1000.0
+                print(f"  > Using TS bandwidth: {table_val:.2f} kHz (table lookup) for {channel_khz} kHz @ {closest_col} us.")
+                return bw_hz
+            else:
+                # Value is NaN -> use 1 / pulse duration
+                fallback_bw = 1.0 / pulse_duration_sec
+                print(f"  > Using TS bandwidth: {fallback_bw/1000.0:.3f} kHz (1/tau, table NaN) for {channel_khz} kHz @ {pulse_len_us:.0f} us.")
+                return fallback_bw
+        else:
+            # Pulse length not close to any standard column -> fallback to 1 / pulse duration
+            fallback_bw = 1.0 / pulse_duration_sec
+            print(f"  > Using TS bandwidth: {fallback_bw/1000.0:.3f} kHz (1/tau, non-standard pulse) for {channel_khz} kHz @ {pulse_len_us:.0f} us.")
+            return fallback_bw
+
+    # 4. Fallback if pulse duration is provided but channel_khz is not in table
+    if pulse_duration_sec is not None and pulse_duration_sec > 0:
+        fallback_bw = 1.0 / pulse_duration_sec
+        print(f"  > Using TS bandwidth: {fallback_bw/1000.0:.3f} kHz (1/tau) for channel {channel_id}.")
+        return fallback_bw
+
+    # 5. Fallback if pulse duration was not provided at all
+    if channel_khz in TS_BANDWIDTH_TABLE_KHZ:
+        val_default = TS_BANDWIDTH_TABLE_KHZ[channel_khz].get(1024)
+        if val_default is None or np.isnan(val_default):
+            val_default = TS_BANDWIDTH_TABLE_KHZ[channel_khz].get(512, 1.0)
+        bw_hz = float(val_default) * 1000.0
+        print(f"  > WARNING: Pulse duration not provided for {channel_id}; defaulting TS bandwidth to {val_default:.2f} kHz.")
+        return bw_hz
+
+    supported = ", ".join(f"{frequency} kHz" for frequency in TS_BANDWIDTH_TABLE_KHZ)
+    raise ValueError(
+        f"Could not determine TS bandwidth from channel name {channel_id!r}. "
+        f"Expected one of: {supported}."
+    )
+
+
 def read_ctd_file(file_path):
     """
     Reads a CTD file (.cnv or .csv) and returns a pandas DataFrame
@@ -258,7 +371,18 @@ def _append_commented_inline_list(lines, key, values, comment, indent=0, quoted=
     lines.append(f'{" " * indent}{key}: {_format_inline_list(values or [], quoted=quoted)}')
 
 
-def _append_commented_block_mapping(lines, key, mapping, header_comment, field_comments, indent=0):
+ENVIRONMENT_SETTINGS_COMMENTS = {
+    "manual_env": "Whether to use manual environmental settings instead of CTD profile.",
+    "manual_temp": "Manual temperature in degrees Celsius.",
+    "manual_sal": "Manual salinity in PSU.",
+    "manual_c": "Manual sound speed in m/s.",
+    "transducer_depth": "Transducer depth in meters.",
+}
+
+
+def _append_commented_block_mapping(lines, key, mapping, header_comment, field_comments=None, indent=0):
+    if field_comments is None:
+        field_comments = {}
     _append_comment(lines, header_comment, indent=indent)
     lines.append(f'{" " * indent}{key}:')
     for field_key, field_value in (mapping or {}).items():
@@ -338,6 +462,14 @@ def _format_channel_block(channel, include_avo_settings):
         _append_commented_scalar(lines, "min_ts", channel.get("min_ts"), "Explicit minimum target strength override in dB.", indent=4)
     if channel.get("max_ts") not in (None, ""):
         _append_commented_scalar(lines, "max_ts", channel.get("max_ts"), "Explicit maximum target strength override in dB.", indent=4)
+    if channel.get("bad_data_regions_file"):
+        _append_commented_scalar(
+            lines,
+            "bad_data_regions_file",
+            channel.get("bad_data_regions_file"),
+            "Channel-specific bad data regions file (.evr) override.",
+            indent=4,
+        )
     det_params = channel.get("detection_parameters") or {}
     if det_params:
         _append_commented_block_mapping(
@@ -373,6 +505,21 @@ def format_saved_config_yaml(config):
             "output_directory",
             config.get("output_directory", ""),
             "Base folder where AVO figures and summary files will be written.",
+        )
+        lines.append("")
+        _append_commented_scalar(
+            lines,
+            "default_ctd",
+            config.get("default_ctd", ""),
+            "Optional CTD file used to calculate the average sound speed along the transducer-to-sphere path.",
+        )
+        lines.append("")
+        _append_commented_block_mapping(
+            lines,
+            "environment_settings",
+            config.get("environment_settings", {}),
+            "Transducer depth used as the start of the CTD sound-speed averaging interval.",
+            {"transducer_depth": "Transducer depth in meters."},
         )
         lines.extend([
             "",
@@ -422,6 +569,14 @@ def format_saved_config_yaml(config):
         "Full path to the CTD file (Sea-Bird .cnv or CastAway .csv).",
     )
     lines.append("")
+    if config.get("bad_data_regions_file"):
+        _append_commented_scalar(
+            lines,
+            "bad_data_regions_file",
+            config.get("bad_data_regions_file", ""),
+            "Optional bad data regions file (.evr) to exclude corrupted or noisy time windows.",
+        )
+        lines.append("")
     _append_commented_scalar(
         lines,
         "default_sphere_size",
@@ -515,6 +670,104 @@ def _scalar_at(value, index=0):
     return float(values if values.ndim == 0 else values[index])
 
 
+def _resolve_sound_speed_and_density(
+    ctd_file,
+    transducer_depth,
+    sphere_range,
+    calibration_sound_speed,
+    latitude,
+    fallback_temp=10.0,
+    fallback_salinity=35.0,
+):
+    """Resolve the common sound speed and density used by a calibration run."""
+    cal_sound_speed = _scalar_at(calibration_sound_speed)
+    sphere_depth = float(transducer_depth) + float(sphere_range)
+
+    if ctd_file and os.path.exists(ctd_file):
+        ctd_df = read_ctd_file(ctd_file).reset_index(drop=True)
+        path_df = ctd_df[
+            (ctd_df["depth"] >= float(transducer_depth))
+            & (ctd_df["depth"] <= sphere_depth)
+        ].copy()
+        if path_df.empty:
+            raise ValueError(
+                f"No CTD data found between {transducer_depth}m and {sphere_depth:.2f}m."
+            )
+
+        if "svel" in path_df.columns:
+            sound_speed = 1 / np.mean(1 / path_df["svel"].to_numpy())
+        else:
+            path_c, path_rho = tsCalc.water_properties(
+                path_df["sal"].values,
+                path_df["temp"].values,
+                path_df["pressure"].values,
+                lon=0.0,
+                lat=latitude,
+            )
+            sound_speed = 1 / np.mean(1 / path_c)
+            return float(sound_speed), float(np.mean(path_rho))
+
+        _, path_rho = tsCalc.water_properties(
+            path_df["sal"].values,
+            path_df["temp"].values,
+            path_df["pressure"].values,
+            lon=0.0,
+            lat=latitude,
+        )
+        return float(sound_speed), float(np.mean(path_rho))
+
+    _, fallback_rho = tsCalc.water_properties(
+        np.array([fallback_salinity]),
+        np.array([fallback_temp]),
+        np.array([sphere_depth]),
+        lon=0.0,
+        lat=latitude,
+    )
+    return cal_sound_speed, float(np.asarray(fallback_rho).flat[0])
+
+
+def _integrate_sphere_window(
+    data,
+    center_range,
+    sound_speed,
+    pulse_duration,
+    layer_axis,
+    half_width_pulse_lengths=1.0,
+):
+    """Integrate the sphere echo over a window centered on the echo envelope."""
+    # Single-target detection calculates range as:
+    #   target_range = (envelope centroid) - (sound_speed * pulse_duration / 4)
+    # To center the integration window symmetrically on the physical echo envelope,
+    # we add (sound_speed * pulse_duration / 4) to center_range.
+    pulse_term = sound_speed * pulse_duration / 4.0
+    echo_center = center_range + pulse_term
+    integration_half_width = (sound_speed * pulse_duration / 2.0) * half_width_pulse_lengths
+    print(integration_half_width)
+    upper_line = line.line(
+        ping_time=data.ping_time,
+        data=echo_center - integration_half_width,
+    )
+    lower_line = line.line(
+        ping_time=data.ping_time,
+        data=echo_center + integration_half_width,
+    )
+
+    integrator = integration.integrator(min_threshold_applied=False)
+    grid_obj = grid.grid(
+        interval_length=10000,
+        interval_axis="ping_number",
+        data=data,
+        layer_axis=layer_axis,
+        layer_thickness=100,
+    )
+    return integrator.integrate(
+        data,
+        grid_obj,
+        exclude_above_line=upper_line,
+        exclude_below_line=lower_line,
+    )
+
+
 def _reject_overlapping_candidates(candidates):
     """Apply Method 2 overlap rejection, retaining the stronger target."""
     accepted = []
@@ -553,16 +806,50 @@ def _calculate_pulse_width(power, peak_index, limit, range_vector, sound_speed, 
     return normalized_width, left, right, envelope_start, envelope_end
 
 
-def _detect_single_target_candidates(d_sp, cal, along, athwart, ping, params):
+def _detect_single_target_candidates(
+    d_sp,
+    cal,
+    along,
+    athwart,
+    ping,
+    params,
+    target_range_min=None,
+    target_range_max=None,
+    sound_speed_override=None,
+):
     """Return Method 2 single-target candidates for one ping."""
     abs_coeff = _scalar_at(cal.absorption_coefficient, ping)
-    range_vector = d_sp.range
-    compensated_range_term = 40 * np.log10(range_vector) + 2 * abs_coeff * range_vector
-    calibrated_power = d_sp.data[ping] - compensated_range_term
-    maxima = argrelextrema(calibrated_power, np.greater)[0]
-    sound_speed = _scalar_at(cal.sound_speed, ping)
+    full_range_vector = d_sp.range
+    sound_speed = (
+        _scalar_at(sound_speed_override)
+        if sound_speed_override is not None
+        else _scalar_at(cal.sound_speed, ping)
+    )
     pulse_duration = _scalar_at(cal.pulse_duration, ping)
     pulse_term = sound_speed * pulse_duration / 4
+
+    if target_range_min is None and target_range_max is None:
+        range_start = 0
+        range_end = len(full_range_vector)
+    else:
+        range_step = np.median(np.diff(full_range_vector)) if len(full_range_vector) > 1 else 0.0
+        envelope_padding = max(sound_speed * pulse_duration, 2 * range_step)
+        lower_bound = -np.inf if target_range_min is None else target_range_min
+        upper_bound = np.inf if target_range_max is None else target_range_max
+        search_mask = (
+            (full_range_vector >= lower_bound - envelope_padding)
+            & (full_range_vector <= upper_bound + envelope_padding)
+        )
+        matching_indices = np.flatnonzero(search_mask)
+        if matching_indices.size == 0:
+            return []
+        range_start = int(matching_indices[0])
+        range_end = int(matching_indices[-1]) + 1
+
+    range_vector = full_range_vector[range_start:range_end]
+    compensated_range_term = 40 * np.log10(range_vector) + 2 * abs_coeff * range_vector
+    calibrated_power = d_sp.data[ping][range_start:range_end] - compensated_range_term
+    maxima = argrelextrema(calibrated_power, np.greater)[0]
     candidates = []
 
     minimum_threshold = params.min_threshold if hasattr(params, 'min_threshold') else params.threshold_min
@@ -585,8 +872,8 @@ def _detect_single_target_candidates(d_sp, cal, along, athwart, ping, params):
         if normalized_width > params.maxNormPulseLen or normalized_width < params.minNormPulseLen:
             continue
 
-        peak_along = along.data[ping][peak_index]
-        peak_athwart = athwart.data[ping][peak_index]
+        peak_along = along.data[ping][range_start + peak_index]
+        peak_athwart = athwart.data[ping][range_start + peak_index]
         along_norm = 2 * peak_along / cal.beam_width_alongship[ping]
         athwart_norm = 2 * peak_athwart / cal.beam_width_athwartship[ping]
         beam_compensation = 6.0206 * (
@@ -601,9 +888,11 @@ def _detect_single_target_candidates(d_sp, cal, along, athwart, ping, params):
         end_index = right - 1
         if (end_index - start_index) < 1:
             continue
-        if np.std(along.data[ping][start_index:end_index]) > params.maxSDalong:
+        angle_start = range_start + start_index
+        angle_end = range_start + end_index
+        if np.std(along.data[ping][angle_start:angle_end]) > params.maxSDalong:
             continue
-        if np.std(athwart.data[ping][start_index:end_index]) > params.maxSDathwart:
+        if np.std(athwart.data[ping][angle_start:angle_end]) > params.maxSDathwart:
             continue
 
         envelope_power = 10 ** (calibrated_power[left:right + 1] / 10)
@@ -632,8 +921,8 @@ def _detect_single_target_candidates(d_sp, cal, along, athwart, ping, params):
             'cTS': compensated_ts,
             'peakAthwart': peak_athwart,
             'peakAlong': peak_along,
-            'sdAlng': np.std(along.data[ping][start_index:end_index]),
-            'sdAthw': np.std(athwart.data[ping][start_index:end_index]),
+            'sdAlng': np.std(along.data[ping][angle_start:angle_end]),
+            'sdAthw': np.std(athwart.data[ping][angle_start:angle_end]),
             'normWidth': normalized_width,
             'envelope_start': envelope_start - pulse_term,
             'envelope_end': envelope_end - pulse_term,
@@ -690,6 +979,8 @@ class EchosounderCalibration:
         self.lon = None
         self.d_sv = None
         self.d_sp = None
+        self.sound_speed = None
+        self.water_density = None
         
         self.params = detectParmsInit(detect_config)
         self.targets = singleTargetsInit()
@@ -821,85 +1112,46 @@ class EchosounderCalibration:
         self._load_bad_data_regions()
 
     def get_reference_ts(self):
-        if self.env_settings.get('manual_env', False):
-            print("  > Using manual environment values.")
-            temp = self.env_settings['manual_temp']
-            sal = self.env_settings['manual_sal']
-            sound_speed = self.env_settings['manual_c']
-            _, rho = tsCalc.water_properties(
-                np.array([sal]),
-                np.array([temp]),
-                np.array([self.sphere_range]),
-                lon=0.0,
-                lat=self.lat,
+        transducer_depth = self.env_settings.get('transducer_depth', 9.15)
+        sound_speed, rho = _resolve_sound_speed_and_density(
+            self.ctd_file,
+            transducer_depth,
+            self.sphere_range,
+            self.cal.sound_speed,
+            self.lat,
+            fallback_temp=self.env_settings.get('manual_temp', 10.0),
+            fallback_salinity=self.env_settings.get('manual_sal', 35.0),
+        )
+        self.sound_speed = sound_speed
+        self.water_density = rho
+        if self.ctd_file and os.path.exists(self.ctd_file):
+            print(
+                f"  > Using average CTD sound speed from {transducer_depth}m "
+                f"to {transducer_depth + self.sphere_range:.2f}m: {sound_speed:.2f} m/s."
             )
-            print(np.array([sal]),
-                            np.array([temp]),
-                            np.array([self.sphere_range]),
-                            lon=0.0,
-                            lat=self.lat)
         else:
-            print("  > Using CTD file for environment values.")
-            if not self.ctd_file or not os.path.exists(self.ctd_file):
-                raise ValueError("CTD file not found or specified, but manual environment mode is off.")
-
-            df = read_ctd_file(self.ctd_file)
-            df = df.reset_index(drop=True)
-
-            sphere_depth = self.sphere_range + 9.15
-            path_df = df[(df['depth'] >= 9) & (df['depth'] <= sphere_depth)].copy()
-
-            if path_df.empty:
-                raise ValueError(f"No CTD data found in the depth range 9m to {sphere_depth:.2f}m.")
-
-            _, path_rho = tsCalc.water_properties(
-                path_df['sal'].values,
-                path_df['temp'].values,
-                path_df['pressure'].values,
-                lon=0.0,
-                lat=self.lat,
-            )
-            rho = path_rho.mean()
-
-            if 'svel' in path_df.columns:
-                print("  > Using sound speed from CTD file.")
-                sound_speed = 1 / np.mean(1 / path_df['svel'])
-            else:
-                print("  > Calculating sound speed from CTD temp/sal/pressure.")
-                path_c, _ = tsCalc.water_properties(
-                    path_df['sal'].values,
-                    path_df['temp'].values,
-                    path_df['pressure'].values,
-                    lon=0.0,
-                    lat=self.lat,
-                )
-                sound_speed = 1 / np.mean(1 / path_c)
-            print(path_df['sal'].values,
-                                path_df['temp'].values,
-                                path_df['pressure'].values,
-                                self.lat,
-                                sound_speed)
+            print(f"  > Using calibration-object sound speed: {sound_speed:.2f} m/s.")
 
         material = tsCalc.material_properties()[self.sphere_mat]
 
         cal_sound_speed = np.mean(self.cal.sound_speed)
         if round(sound_speed, 1) != round(cal_sound_speed, 1):
             print(
-                f"  > WARNING: Sound speed mismatch. CTD/manual value is {sound_speed:.1f} m/s, "
+                f"  > WARNING: Sound speed mismatch. Resolved value is {sound_speed:.1f} m/s, "
                 f"while calibration object value is {cal_sound_speed:.1f} m/s."
             )
         
         f = _scalar_at(self.cal.frequency)
         pulse_duration = _scalar_at(self.cal.pulse_duration)
-        if pulse_duration <= 0:
-            raise ValueError(f"Pulse duration must be positive, got {pulse_duration} s.")
-        bw = 1 / pulse_duration
+        bw = _ts_bandwidth_from_channel_name(self.channel_id, pulse_duration=pulse_duration, frequency=f)
         
         fr, ts = tsCalc.freq_response(f-bw/2, f+bw/2, self.sphere_size/1000/2, sound_speed, 
                                       material['c1'], material['c2'], rho, material['rho1'], fstep=100)
         return 10 * np.log10(np.mean(10**(ts/10)))
 
-    def detect_targets(self):
+    def detect_targets(self, target_range_min=None, target_range_max=None):
+        if not self.bad_data_regions and self.bad_data_regions_file:
+            self._load_bad_data_regions()
         ping_times_dt = pd.to_datetime(self.d_sp.ping_time)
         self.targets = singleTargetsInit()
 
@@ -908,7 +1160,15 @@ class EchosounderCalibration:
             if any(start_time <= ping_time <= end_time for start_time, end_time in self.bad_data_regions):
                 continue
             for candidate in _detect_single_target_candidates(
-                self.d_sp, self.cal, self.along, self.athwart, ping, self.params,
+                self.d_sp,
+                self.cal,
+                self.along,
+                self.athwart,
+                ping,
+                self.params,
+                target_range_min=target_range_min,
+                target_range_max=target_range_max,
+                sound_speed_override=self.sound_speed,
             ):
                 self._append_target(
                     ping, candidate['r'], candidate['uTS'], candidate['cTS'],
@@ -954,7 +1214,10 @@ class EchosounderCalibration:
         ref_ts = self.get_reference_ts()
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            self.detect_targets()        
+            self.detect_targets(
+                target_range_min=self.sphere_range - range_tolerance,
+                target_range_max=self.sphere_range + range_tolerance,
+            )
         
         # Determine TS Mask: If explicit min/max TS provided, use them. Else use tolerance around Ref TS.
         if min_ts is not None and max_ts is not None:
@@ -1013,22 +1276,26 @@ class EchosounderCalibration:
 
             fig_echo = figure(figsize=(12, 4))
             eg = echogram.Echogram(fig_echo, d_sv_on_axis, threshold=[-90, -30])
+            pulse_duration = _scalar_at(self.cal.pulse_duration)
+            pulse_term = self.sound_speed * pulse_duration / 4.0
+            hw = (self.sound_speed * pulse_duration / 2.0)
+            u_line = line.line(ping_time=d_sv_on_axis.ping_time, data=mean_range + pulse_term - hw)
+            l_line = line.line(ping_time=d_sv_on_axis.ping_time, data=mean_range + pulse_term + hw)
+            eg.plot_line(u_line, color='black', linewidth=1, linestyle='--')
+            eg.plot_line(l_line, color='black', linewidth=1, linestyle='--')
             eg.add_colorbar(fig_echo)
             plt.title(f"Echogram: {self.channel_id}")
             if plot_save_dir:
                 plt.savefig(os.path.join(plot_save_dir, f"{clean_id}_echogram.png"))
             plt.close(fig_echo)
 
-        upper_line = line.line(ping_time=d_sv_on_axis.ping_time, data=mean_range - (range_tolerance)) 
-        lower_line = line.line(ping_time=d_sv_on_axis.ping_time, data=mean_range + (range_tolerance)) 
-
-        integrator = integration.integrator(min_threshold_applied=False)
-        grid_obj = grid.grid(interval_length=10000, interval_axis='ping_number', 
-                             data=d_sv_on_axis, layer_axis='range', layer_thickness=100)
-        
-        integrated = integrator.integrate(d_sv_on_axis, grid_obj, 
-                                          exclude_above_line=upper_line, 
-                                          exclude_below_line=lower_line)
+        integrated = _integrate_sphere_window(
+            d_sv_on_axis,
+            mean_range,
+            self.sound_speed,
+            _scalar_at(self.cal.pulse_duration),
+            layer_axis="range",
+        )
 
         eba = np.unique(self.cal.equivalent_beam_angle)[0]
         ref_nasc = (10**(ref_ts / 10) * (1852**2) * 4 * np.pi) / ((10**(eba / 10)) * (mean_range**2))
@@ -1098,7 +1365,7 @@ def run_batch_calibration(config_path, do_plot=True):
                     raw_files=ch_conf['raw_files'],
                     ctd_file=ch_conf.get('ctd_file', global_ctd),
                     env_settings=env_settings,
-                    bad_data_regions_file=bad_data_regions_file,
+                    bad_data_regions_file=ch_conf.get('bad_data_regions_file', bad_data_regions_file),
                     sphere_range=ch_conf['sphere_range'],
                     sphere_size=ch_conf.get('sphere_size', global_sphere),
                     sphere_mat=ch_conf.get('sphere_material', global_sphere_mat),
@@ -1252,11 +1519,13 @@ class TriwaveCorrect:
 
 
 class AVOCalibrationSession:
-    def __init__(self, channel_id, raw_files, sphere_range, settings, output_dir):
+    def __init__(self, channel_id, raw_files, sphere_range, settings, output_dir, ctd_file=None, transducer_depth=9.15):
         self.channel_id = channel_id
         self.raw_files = expand_raw_files(raw_files)
         self.sphere_range = float(sphere_range)
         self.settings = merge_avo_settings(settings)
+        self.ctd_file = ctd_file
+        self.transducer_depth = float(transducer_depth)
         self.output_dir = output_dir
         self.figure_dir = os.path.join(output_dir, "plots")
         os.makedirs(self.figure_dir, exist_ok=True)
@@ -1278,6 +1547,8 @@ class AVOCalibrationSession:
         self.ping_day = None
         self.triwave_corrected = False
         self.triwave_fit_results = None
+        self.sound_speed = None
+        self.water_density = None
 
     def _first_scalar(self, value):
         arr = np.atleast_1d(value)
@@ -1336,17 +1607,28 @@ class AVOCalibrationSession:
             raise ValueError("AVO mode only supports CW data.")
 
         material = tsCalc.material_properties()[self.settings["sphere_material"]]
-        sound_speed, density = tsCalc.water_properties(
-            float(self.settings["salinity"]),
-            float(self.settings["temp"]),
-            self.sphere_depth,
-            lon=0.0,
-            lat=self.lat,
+        sound_speed, density = _resolve_sound_speed_and_density(
+            self.ctd_file,
+            self.transducer_depth,
+            self.sphere_range,
+            self.cal.sound_speed,
+            self.lat,
+            fallback_temp=self.settings["temp"],
+            fallback_salinity=self.settings["salinity"],
         )
+        self.sound_speed = sound_speed
+        self.water_density = density
+        if self.ctd_file and os.path.exists(self.ctd_file):
+            print(
+                f"  > Using average CTD sound speed from {self.transducer_depth}m "
+                f"to {self.transducer_depth + self.sphere_range:.2f}m: {sound_speed:.2f} m/s."
+            )
         pulse_duration = self._first_scalar(self.cal.pulse_duration)
-        if pulse_duration <= 0:
-            raise ValueError(f"Pulse duration must be positive, got {pulse_duration} s.")
-        bandwidth = 1 / pulse_duration
+        bandwidth = _ts_bandwidth_from_channel_name(
+            self.channel_id,
+            pulse_duration=pulse_duration,
+            frequency=self.frequency,
+        )
         _, ts = tsCalc.freq_response(
             self.frequency - bandwidth / 2,
             self.frequency + bandwidth / 2,
@@ -1364,7 +1646,15 @@ class AVOCalibrationSession:
         self.targets = AVOSingleTargets()
         for ping in range(self.d_sp.n_pings):
             for candidate in _detect_single_target_candidates(
-                self.d_sp, self.cal, self.along, self.athwart, ping, self.params,
+                self.d_sp,
+                self.cal,
+                self.along,
+                self.athwart,
+                ping,
+                self.params,
+                target_range_min=self.params.excludeAbove,
+                target_range_max=self.params.excludeBelow,
+                sound_speed_override=self.sound_speed,
             ):
                 self.targets.ping = np.append(self.targets.ping, ping)
                 self.targets.r = np.append(self.targets.r, candidate['r'])
@@ -1564,6 +1854,23 @@ class AVOCalibrationSession:
         result["mean_detected_ts_db"] = float(np.mean(self.sphere_targets.cTS))
         result["ts_std_db"] = float(np.std(self.sphere_targets.cTS))
 
+        # Integrate only the pings containing sphere detections. AVO data is
+        # represented in depth coordinates, so convert the detected mean range
+        # to the corresponding mean depth before constructing the bounds.
+        d_sv_on_axis = self.d_sv.copy()
+        target_pings = np.unique(self.sphere_targets.ping).astype(int)
+        all_pings = np.arange(self.d_sv.n_pings)
+        d_sv_on_axis.delete(index_array=all_pings[~np.isin(all_pings, target_pings)])
+        mean_sphere_depth = result["mean_detected_range_m"] + float(self.d_sv.depth[0])
+        integrated = _integrate_sphere_window(
+            d_sv_on_axis,
+            mean_sphere_depth,
+            self.sound_speed,
+            _scalar_at(self.cal.pulse_duration),
+            layer_axis="depth",
+        )
+        result["observed_nasc"] = float(integrated.nasc[0][0])
+
         if do_plot:
             beam_radius_m, on_axis_hit_count, coverage_status = self.create_beam_plot()
             self.create_ts_histogram(ref_ts)
@@ -1600,6 +1907,9 @@ def run_avo_batch_calibration(config_path, do_plot=True):
     os.makedirs(base_dir, exist_ok=True)
 
     avo_settings = merge_avo_settings(config.get("avo_settings", {}))
+    ctd_file = config.get("default_ctd")
+    environment_settings = config.get("environment_settings", {})
+    transducer_depth = environment_settings.get("transducer_depth", 9.15)
     all_results = []
     channels = config.get("channels", []) or []
 
@@ -1616,6 +1926,8 @@ def run_avo_batch_calibration(config_path, do_plot=True):
                 sphere_range=channel["sphere_range"],
                 settings=avo_settings,
                 output_dir=base_dir,
+                ctd_file=channel.get("ctd_file", ctd_file),
+                transducer_depth=transducer_depth,
             )
             all_results.append(session.run_check(do_plot=do_plot))
         except Exception as exc:
@@ -1660,7 +1972,7 @@ class TextRedirector(object):
 class QuickCalGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("QuickCal EV / AVO - Echosounder Calibration")
+        self.root.title("QuickCal v2 EV / AVO - Echosounder Calibration")
         self.root.geometry("900x800")
         self.calibration_mode = CONFIG_MODE_QUICKCAL
         self.avo_settings = get_default_avo_settings()
@@ -1707,13 +2019,13 @@ class QuickCalGUI:
         ttk.Button(top_frame, text="Load Config (YAML)", command=self.load_yaml).pack(side=tk.LEFT, padx=5)
         ttk.Button(top_frame, text="Save Config (YAML)", command=self.save_yaml_as).pack(side=tk.LEFT, padx=5)
         ttk.Label(top_frame, textvariable=self.mode_label_var).pack(side=tk.LEFT, padx=10)
-        bad_data_button = ttk.Button(
+        self.bad_data_button = ttk.Button(
             top_frame,
             text="Generate Bad Data Regions",
             command=self.generate_bad_data_regions_file,
         )
-        bad_data_button.pack(side=tk.RIGHT, padx=5)
-        self.quickcal_only_widgets.append(bad_data_button)
+        self.bad_data_button.pack(side=tk.RIGHT, padx=5)
+        self.quickcal_only_widgets.append(self.bad_data_button)
         self.run_button = ttk.Button(
             top_frame,
             text="RUN CALIBRATION",
@@ -1772,7 +2084,13 @@ class QuickCalGUI:
             command=self.load_bad_data_regions,
         )
         bad_data_load_button.pack(side=tk.LEFT)
-        self.quickcal_only_widgets.extend([bad_data_entry, bad_data_load_button])
+        bad_data_clear_button = ttk.Button(
+            bad_data_frame,
+            text="Clear",
+            command=lambda: self.bad_data_regions_file.set(""),
+        )
+        bad_data_clear_button.pack(side=tk.LEFT, padx=(2, 0))
+        self.quickcal_only_widgets.extend([bad_data_entry, bad_data_load_button, bad_data_clear_button])
         
         grid_f1 = ttk.Frame(f1)
         grid_f1.pack(fill=tk.X, pady=5)
@@ -1845,10 +2163,18 @@ class QuickCalGUI:
         sys.stdout = TextRedirector(self.console, "stdout")
         sys.stderr = TextRedirector(self.console, "stderr")
 
+    def _keep_child_window_in_front(self, window):
+        """Keep an editing window above the main GUI until it is closed."""
+        window.transient(self.root)
+        window.lift()
+        window.focus_force()
+        window.grab_set()
+
     def open_env_dialog(self):
         env_popup = tk.Toplevel(self.root)
         env_popup.title("Calculate and Set Environment")
         env_popup.geometry("500x350")
+        self._keep_child_window_in_front(env_popup)
 
         top_frame = ttk.Frame(env_popup, padding=10)
         top_frame.pack(fill=tk.X)
@@ -1871,7 +2197,13 @@ class QuickCalGUI:
             command=toggle_mode,
         ).pack(side=tk.LEFT)
 
-        self.create_file_entry(ctd_frame, "CTD File:", self.ctd_file, False)
+        self.create_file_entry(
+            ctd_frame,
+            "CTD File:",
+            self.ctd_file,
+            False,
+            dialog_parent=env_popup,
+        )
 
         calc_frame = ttk.LabelFrame(ctd_frame, text="Calculate Average from CTD", padding=10)
         calc_frame.pack(fill=tk.X, padx=5, pady=10)
@@ -1890,7 +2222,7 @@ class QuickCalGUI:
             calc_frame,
             text="Calculate",
             command=lambda: self.calculate_ctd_averages(
-                end_depth_var.get(), self.transducer_depth.get()
+                end_depth_var.get(), self.transducer_depth.get(), parent=env_popup
             ),
         ).pack(pady=5)
 
@@ -1913,10 +2245,10 @@ class QuickCalGUI:
         ttk.Button(env_popup, text="Save and Close", command=save_and_close).pack(pady=10)
         toggle_mode()
 
-    def calculate_ctd_averages(self, end_depth, transducer_depth=None):
+    def calculate_ctd_averages(self, end_depth, transducer_depth=None, parent=None):
         ctd_path = self.ctd_file.get()
         if not ctd_path or not os.path.exists(ctd_path):
-            messagebox.showerror("Error", "Please select a valid CTD file first.")
+            messagebox.showerror("Error", "Please select a valid CTD file first.", parent=parent)
             return
 
         try:
@@ -1926,6 +2258,7 @@ class QuickCalGUI:
                 messagebox.showwarning(
                     "Warning",
                     "Transducer depth must be less than the end depth.",
+                    parent=parent,
                 )
                 return
 
@@ -1936,14 +2269,23 @@ class QuickCalGUI:
                     "Warning",
                     f"No CTD data found in the specified depth range "
                     f"({transducer_depth}m to {end_depth}m)",
+                    parent=parent,
                 )
                 return
 
-            avg_df = ctd_df[mask]
+            profile_df = (
+                ctd_df[['depth', 'temp', 'sal']]
+                .dropna()
+                .sort_values('depth')
+            )
+            avg_df = profile_df[
+                (profile_df['depth'] >= transducer_depth)
+                & (profile_df['depth'] <= end_depth)
+            ]
             avg_temp = avg_df['temp'].mean()
             avg_sal = avg_df['sal'].mean()
             mid_depth = (transducer_depth + end_depth) / 2
-            sound_speed, _ = tsCalc.water_properties(
+            avg_sound_speed, _ = tsCalc.water_properties(
                 np.array([avg_sal]),
                 np.array([avg_temp]),
                 np.array([mid_depth]),
@@ -1951,17 +2293,38 @@ class QuickCalGUI:
                 lat=55.0,
             )
 
+            transducer_temp = np.interp(
+                transducer_depth, profile_df['depth'], profile_df['temp']
+            )
+            transducer_sal = np.interp(
+                transducer_depth, profile_df['depth'], profile_df['sal']
+            )
+            transducer_sound_speed, _ = tsCalc.water_properties(
+                np.array([transducer_sal]),
+                np.array([transducer_temp]),
+                np.array([transducer_depth]),
+                lon=0.0,
+                lat=55.0,
+            )
+
             messagebox.showinfo(
                 "CTD Calculation Results",
                 (
+                    f"Values at transducer depth ({transducer_depth}m):\n"
+                    f"  - Temperature: {transducer_temp:.3f} °C\n"
+                    f"  - Salinity: {transducer_sal:.3f} PSU\n"
+                    f"  - Sound Speed: {transducer_sound_speed.item():.3f} m/s\n\n"
                     f"Average values from {transducer_depth}m to {end_depth}m:\n"
                     f"  - Temperature: {avg_temp:.3f} °C\n"
                     f"  - Salinity: {avg_sal:.3f} PSU\n"
-                    f"  - Sound Speed: {sound_speed.item():.3f} m/s"
+                    f"  - Sound Speed: {avg_sound_speed.item():.3f} m/s"
                 ),
+                parent=parent,
             )
         except Exception as exc:
-            messagebox.showerror("CTD Calculation Error", f"An error occurred: {exc}")
+            messagebox.showerror(
+                "CTD Calculation Error", f"An error occurred: {exc}", parent=parent
+            )
 
     def update_env_status_label(self):
         if self.manual_env.get():
@@ -1972,7 +2335,7 @@ class QuickCalGUI:
         else:
             self.env_status_label.config(text="CTD not set", foreground="red")
 
-    def create_file_entry(self, parent, label, var, is_dir=False):
+    def create_file_entry(self, parent, label, var, is_dir=False, dialog_parent=None):
         frame = ttk.Frame(parent)
         frame.pack(fill=tk.X, pady=2)
         label_widget = ttk.Label(frame, text=label, width=15, anchor="e")
@@ -1982,9 +2345,9 @@ class QuickCalGUI:
         
         def browse():
             if is_dir:
-                path = filedialog.askdirectory()
+                path = filedialog.askdirectory(parent=dialog_parent)
             else:
-                path = filedialog.askopenfilename()
+                path = filedialog.askopenfilename(parent=dialog_parent)
             if path:
                 var.set(path)
                 
@@ -2034,13 +2397,15 @@ class QuickCalGUI:
         
         popup = tk.Toplevel(self.root)
         popup.title(title)
-        popup.geometry("500x480" if is_avo_mode else "500x750")
+        popup.geometry("500x480" if is_avo_mode else "520x780")
+        self._keep_child_window_in_front(popup)
         
         # Initialize Variables
         c_id = tk.StringVar()
         c_range = tk.DoubleVar(value=21.0)
         c_size = tk.DoubleVar(value=0.0) # 0 means use global
         c_mat = tk.StringVar() # Empty means use global
+        c_bad_data = tk.StringVar()
         
         # TS Override variables (StringVar allows empty check)
         c_ts_tol = tk.StringVar()
@@ -2064,6 +2429,7 @@ class QuickCalGUI:
             c_range.set(data.get('sphere_range', 21.0))
             c_size.set(data.get('sphere_size', 0.0))
             c_mat.set(data.get('sphere_material', ''))
+            c_bad_data.set(data.get('bad_data_regions_file', ''))
             
             # TS params
             if 'sphere_ts_tolerance' in data:
@@ -2105,6 +2471,21 @@ class QuickCalGUI:
             ttk.Label(info_frame, text="Sphere Material:").grid(row=3, column=0, sticky="e")
             ttk.Entry(info_frame, textvariable=c_mat, width=15).grid(row=3, column=1, sticky="w", padx=5)
             ttk.Label(info_frame, text="(Empty = Use Global)").grid(row=3, column=2, sticky="w")
+
+            ttk.Label(info_frame, text="Bad Data File:").grid(row=4, column=0, sticky="e")
+            ttk.Entry(info_frame, textvariable=c_bad_data, width=25).grid(row=4, column=1, sticky="w", padx=5)
+            def browse_channel_bad_data():
+                p = filedialog.askopenfilename(
+                    filetypes=[("Echoview Region Files", "*.evr"), ("All files", "*.*")],
+                    title="Select Channel Bad Data Regions File",
+                    parent=popup,
+                )
+                if p:
+                    c_bad_data.set(p)
+            c_bd_btn_frame = ttk.Frame(info_frame)
+            c_bd_btn_frame.grid(row=4, column=2, sticky="w")
+            ttk.Button(c_bd_btn_frame, text="Browse...", command=browse_channel_bad_data).pack(side=tk.LEFT)
+            ttk.Button(c_bd_btn_frame, text="Clear", command=lambda: c_bad_data.set("")).pack(side=tk.LEFT, padx=2)
 
             ts_frame = ttk.LabelFrame(popup, text="TS Filtering Overrides (Leave empty to use Global defaults)", padding=10)
             ts_frame.pack(fill=tk.X, padx=10, pady=5)
@@ -2154,7 +2535,10 @@ class QuickCalGUI:
             lst.insert(tk.END, os.path.basename(f))
         
         def add_files():
-            fs = filedialog.askopenfilenames(filetypes=[("Raw Files", "*.raw"), ("All Files", "*.*")])
+            fs = filedialog.askopenfilenames(
+                filetypes=[("Raw Files", "*.raw"), ("All Files", "*.*")],
+                parent=popup,
+            )
             for f in fs:
                 if f not in files_list:
                     files_list.append(f)
@@ -2185,6 +2569,8 @@ class QuickCalGUI:
                     ch_data['sphere_size'] = c_size.get()
                 if c_mat.get():
                     ch_data['sphere_material'] = c_mat.get()
+                if c_bad_data.get().strip():
+                    ch_data['bad_data_regions_file'] = c_bad_data.get().strip()
 
                 try:
                     if c_ts_tol.get().strip():
@@ -2262,8 +2648,22 @@ class QuickCalGUI:
         if not output_path:
             return
 
+        self.bad_data_button.configure(state="disabled")
+        progress_dialog = tk.Toplevel(self.root)
+        progress_dialog.title("Creating EV File")
+        progress_dialog.transient(self.root)
+        progress_dialog.resizable(False, False)
+        ttk.Label(
+            progress_dialog,
+            text="The EV file is being created. Please wait...",
+            padding=20,
+        ).pack()
+        progress_dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+        self.root.update_idletasks()
+
         try:
             self.generate_ev_file(expand_raw_files(all_raw_files), output_path)
+            progress_dialog.destroy()
             messagebox.showinfo(
                 "Next Steps",
                 (
@@ -2275,7 +2675,11 @@ class QuickCalGUI:
                 ),
             )
         except Exception as exc:
+            if progress_dialog.winfo_exists():
+                progress_dialog.destroy()
             messagebox.showerror("Echoview Error", f"Failed to generate EV file: {exc}")
+        finally:
+            self.bad_data_button.configure(state="normal")
 
     def load_bad_data_regions(self):
         """Load a bad data regions file."""
@@ -2312,6 +2716,7 @@ class QuickCalGUI:
         config = {
             'output_directory': self.output_dir.get(),
             'default_ctd': self.ctd_file.get(),
+            'bad_data_regions_file': self.bad_data_regions_file.get(),
             'default_sphere_size': self.sphere_size.get(),
             'default_sphere_material': self.sphere_mat.get(),
             'sphere_range_tolerance': self.range_tol.get(),
@@ -2339,6 +2744,11 @@ class QuickCalGUI:
             config = {
                 'calibration_mode': CONFIG_MODE_AVO,
                 'output_directory': self.output_dir.get(),
+                'default_ctd': self.ctd_file.get(),
+                'bad_data_regions_file': self.bad_data_regions_file.get(),
+                'environment_settings': {
+                    'transducer_depth': self.transducer_depth.get(),
+                },
                 'avo_settings': copy.deepcopy(self.avo_settings),
                 'channels': self.channels,
             }
