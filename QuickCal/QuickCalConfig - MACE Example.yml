@@ -1,0 +1,92 @@
+##### Configuration file for QuickCal tool #####
+
+# Before using this file, set the CTD file, channel sphere ranges, and raw file paths.
+
+### Global definitions ###
+
+# Output directory for calibration results.
+output_directory: "D:/MACE-repos/pyEcholab-CalibrationTools/QuickCal/CalCompare/presentation"
+
+# Full path to the CTD file (Sea-Bird .cnv or CastAway .csv).
+default_ctd: "D:/MACE-repos/pyEcholab-CalibrationTools/QuickCal/CalCompare/presentation/CTD064processed.cnv"
+
+# The only default environmental setting we are using.
+environment_settings:
+  transducer_depth: 9.15
+
+# Default sphere size in millimeters; channel-specific values override this.
+default_sphere_size: 38.1
+# Default sphere material; channel-specific values override this.
+default_sphere_material: "Tungsten carbide"
+# Allowed +/- range around each channel's sphere_range, in meters.
+sphere_range_tolerance: 1.0
+# Allowed +/- target strength window around the calculated reference TS.
+sphere_ts_tolerance: 1
+
+# Global single target detection parameters; channel-specific overrides win.
+detection_parameters:
+  # Pulse length determination level (dB below the pulse peak).
+  PLDL: 6.0
+  # Maximum normalized pulse length allowed for accepted targets.
+  maxNormPulseLen: 1.5
+  # Minimum normalized pulse length allowed for accepted targets.
+  minNormPulseLen: 0.1
+  # Maximum beam compensation value allowed for accepted targets.
+  maxBeamComp: 0.1
+  # Maximum alongship angle standard deviation for accepted targets.
+  maxSDalong: 0.6
+  # Maximum athwartship angle standard deviation for accepted targets.
+  maxSDathwart: 0.6
+  # Minimum target strength (dB) retained during target detection.
+  min_threshold: -50.0
+  # Maximum target strength (dB) retained during target detection.
+  max_threshold: 0
+
+### Channel definitions and parameters ###
+
+channels:
+  # Channel ID.
+  - id: "WBT 998500-15 ES18-11mk2_1"
+    # Raw file(s). Use wildcards like [.../*.raw] to capture all files in a folder.
+    raw_files: ['D:/MACE-repos/pyEcholab-CalibrationTools/QuickCal/CalCompare/presentation/data/DY2604-Cal-D20260806-T153400cw.raw']
+    # Sphere range in meters during on-axis collection.
+    sphere_range: 25.85
+    # Sphere size in millimeters.
+    sphere_size: 38.1
+
+  # Channel ID.
+  - id: "WBT 978217-15 ES38-7_1"
+    # Raw file(s). Use wildcards like [.../*.raw] to capture all files in a folder.
+    raw_files: ['D:/MACE-repos/pyEcholab-CalibrationTools/QuickCal/CalCompare/presentation/data/DY2604-Cal-D20260806-T151057cw.raw']
+    # Sphere range in meters during on-axis collection.
+    sphere_range: 25.85
+    # Sphere size in millimeters.
+    sphere_size: 38.1
+
+  # Channel ID.
+  - id: "WBT 978213-15 ES70-7C_1"
+    # Raw file(s). Use wildcards like [.../*.raw] to capture all files in a folder.
+    raw_files: ['D:/MACE-repos/pyEcholab-CalibrationTools/QuickCal/CalCompare/presentation/data/DY2604-Cal-D20260806-T144900cw.raw', 'D:/MACE-repos/pyEcholab-CalibrationTools/QuickCal/CalCompare/presentation/data/DY2604-Cal-D20260806-T145909cw.raw', 'D:/MACE-repos/pyEcholab-CalibrationTools/QuickCal/CalCompare/presentation/data/DY2604-Cal-D20260806-T144603cw.raw']
+    # Sphere range in meters during on-axis collection.
+    sphere_range: 25.85
+    # Sphere size in millimeters.
+    sphere_size: 38.1
+
+  # Channel ID.
+  - id: "WBT 976714-15 ES120-7C_1"
+    # Raw file(s). Use wildcards like [.../*.raw] to capture all files in a folder.
+    raw_files: ['D:/MACE-repos/pyEcholab-CalibrationTools/QuickCal/CalCompare/presentation/data/DY2604-Cal-D20260806-T145942cw.raw']
+    # Sphere range in meters during on-axis collection.
+    sphere_range: 25.85
+    # Sphere size in millimeters.
+    sphere_size: 38.1
+
+  # Channel ID.
+  - id: "WBT 978208-15 ES200-7C_1"
+    # Raw file(s). Use wildcards like [.../*.raw] to capture all files in a folder.
+    raw_files: ['D:/MACE-repos/pyEcholab-CalibrationTools/QuickCal/CalCompare/presentation/data/DY2604-Cal-D20260806-T152129cw.raw', 'D:/MACE-repos/pyEcholab-CalibrationTools/QuickCal/CalCompare/presentation/data/DY2604-Cal-D20260806-T152301cw.raw', 'D:/MACE-repos/pyEcholab-CalibrationTools/QuickCal/CalCompare/presentation/data/DY2604-Cal-D20260806-T153303cw.raw']
+    # Sphere range in meters during on-axis collection.
+    sphere_range: 25.85
+    # Sphere size in millimeters.
+    sphere_size: 38.1
+    # Channel-specific single target detection parameter overrides.
