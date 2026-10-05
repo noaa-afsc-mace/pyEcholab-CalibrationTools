@@ -53,19 +53,21 @@ avo_settings:
   sphere_diameter: 38.1
   sphere_material: "Tungsten carbide"
   beam_width_deg: 6.5
-  vessel: "Dyson"
+  vessel: "AKN"
   subsector_divisions: 6
   min_targets_per_division: 1
 
 ### Channel definitions ###
 
 channels:
-  - id: "WBT 978217-15 ES38-7_1"
+  - id: "GPT 009072067bdf-1 ES38B_ES"
     raw_files:
-      - 'Y:/MACE_Acoustic2/DY2604/ek80/reprocessed-cw/DY2604-Cal-D20260806-T151057cw.raw'
-    sphere_range: 25.85
+      - 'G:/AVO/Calibration - Logsheets - Quick Checks/2026/Alaska Knight/calibration- july 5/RawFiles/AKN-D20260705-T213421.raw'
+      - 'G:/AVO/Calibration - Logsheets - Quick Checks/2026/Alaska Knight/calibration- july 5/RawFiles/AKN-D20260705-T220842.raw'
+    sphere_range: 28
 
-  - id: "WBT 976714-15 ES120-7C_1"
+  - id: "GPT 00907205cab9-1 ES120-7C_ES"
     raw_files:
-      - 'Y:/MACE_Acoustic2/DY2604/ek80/reprocessed-cw/DY2604-Cal-D20260806-T145942cw.raw'
-    sphere_range: 25.85
+      - 'G:/AVO/Calibration - Logsheets - Quick Checks/2026/Alaska Knight/calibration- july 5/RawFiles/AKN-D20260705-T213421.raw'
+      - 'G:/AVO/Calibration - Logsheets - Quick Checks/2026/Alaska Knight/calibration- july 5/RawFiles/AKN-D20260705-T220842.raw'
+    sphere_range: 28

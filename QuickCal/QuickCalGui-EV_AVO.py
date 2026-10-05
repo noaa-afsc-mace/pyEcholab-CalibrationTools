@@ -742,7 +742,6 @@ def _integrate_sphere_window(
     pulse_term = sound_speed * pulse_duration / 4.0
     echo_center = center_range + pulse_term
     integration_half_width = (sound_speed * pulse_duration / 2.0) * half_width_pulse_lengths
-    print(integration_half_width)
     upper_line = line.line(
         ping_time=data.ping_time,
         data=echo_center - integration_half_width,
@@ -2650,16 +2649,37 @@ class QuickCalGUI:
 
         self.bad_data_button.configure(state="disabled")
         progress_dialog = tk.Toplevel(self.root)
-        progress_dialog.title("Creating EV File")
+        progress_dialog.title("Making EV File")
         progress_dialog.transient(self.root)
         progress_dialog.resizable(False, False)
+        message_frame = ttk.Frame(progress_dialog, padding=20)
+        message_frame.pack()
         ttk.Label(
-            progress_dialog,
-            text="The EV file is being created. Please wait...",
-            padding=20,
+            message_frame,
+            text=(
+                f"Echoview file '{os.path.basename(output_path)}' being created, "
+                "please wait."
+            ),
+            justify=tk.CENTER,
         ).pack()
         progress_dialog.protocol("WM_DELETE_WINDOW", lambda: None)
         self.root.update_idletasks()
+        progress_dialog.update_idletasks()
+
+        # Center the dialog over the main window after its contents determine
+        # the required size.
+        dialog_width = progress_dialog.winfo_width()
+        dialog_height = progress_dialog.winfo_height()
+        root_x = self.root.winfo_rootx()
+        root_y = self.root.winfo_rooty()
+        root_width = self.root.winfo_width()
+        root_height = self.root.winfo_height()
+        dialog_x = root_x + max(0, (root_width - dialog_width) // 2)
+        dialog_y = root_y + max(0, (root_height - dialog_height) // 2)
+        progress_dialog.geometry(f"+{dialog_x}+{dialog_y}")
+        progress_dialog.lift()
+        progress_dialog.grab_set()
+        progress_dialog.update()
 
         try:
             self.generate_ev_file(expand_raw_files(all_raw_files), output_path)
