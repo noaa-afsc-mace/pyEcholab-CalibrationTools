@@ -1,8 +1,8 @@
 '''
-pyhton
+python
 import QuickCal
- QuickCal.run_batch_calibration('D:\\MACE-repos\\pyEcholab-CalibrationTools\\QuickCal\\config.yml')
- '''
+QuickCal.run_batch_calibration('D:\\MACE-repos\\pyEcholab-CalibrationTools\\QuickCal\\config.yml')
+'''
 
 import os
 import re
@@ -18,11 +18,9 @@ import yaml
 from glob import glob
 from scipy.signal import argrelextrema
 
-# Ensure MACEFunctions are accessible
-sys.path.insert(0, "G:/WPy64-31150/applications/MaceFunctions")
-from echolab2.instruments import echosounder
-from echolab2.plotting.matplotlib import echogram
-from echolab2.processing import line, grid, integration
+from MaceFunctions.echolab2.instruments import echosounder
+from MaceFunctions.echolab2.plotting.matplotlib import echogram
+from MaceFunctions.echolab2.processing import line, grid, integration
 from matplotlib.pyplot import figure, show
 
 class detectParmsInit():
