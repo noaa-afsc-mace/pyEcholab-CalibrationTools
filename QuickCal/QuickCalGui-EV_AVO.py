@@ -8,9 +8,7 @@ from datetime import datetime
 
 import gsw
 import matplotlib
-# Use Agg backend to prevent thread issues with Matplotlib if strictly saving plots,
-# or standard backend if interactive. Defaulting to standard but handling closes.
-matplotlib.use('TkAgg') 
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -448,6 +446,12 @@ def format_saved_config_yaml(config):
         config.get("sphere_ts_tolerance", 1),
         "Allowed +/- target strength window around the calculated reference TS.",
     )
+    _append_commented_block_mapping(
+        lines,
+        "environment_settings",
+        config.get("environment_settings", {}),
+        "Environment values and transducer depth used for CTD averaging.",
+    )
     lines.append("")
     _append_commented_block_mapping(
         lines,
@@ -503,6 +507,139 @@ class detectParmsInit():
         self.excludeAbove = config.get('excludeAbove', 0)
         self.min_threshold = config.get('min_threshold', -50)
         self.max_threshold = config.get('max_threshold', -20)
+
+
+def _scalar_at(value, index=0):
+    """Return a calibration value as a scalar, supporting scalar/array values."""
+    values = np.asarray(value)
+    return float(values if values.ndim == 0 else values[index])
+
+
+def _reject_overlapping_candidates(candidates):
+    """Apply Method 2 overlap rejection, retaining the stronger target."""
+    accepted = []
+    for candidate in sorted(candidates, key=lambda item: item['r']):
+        overlapping = [
+            item for item in accepted
+            if item['envelope_start'] <= candidate['envelope_end']
+            and candidate['envelope_start'] <= item['envelope_end']
+        ]
+        if not overlapping:
+            accepted.append(candidate)
+            continue
+
+        if all(candidate['cTS'] > item['cTS'] for item in overlapping):
+            accepted = [item for item in accepted if item not in overlapping]
+            accepted.append(candidate)
+
+    return sorted(accepted, key=lambda item: item['r'])
+
+
+def _calculate_pulse_width(power, peak_index, limit, range_vector, sound_speed, pulse_duration):
+    """Calculate the Echoview-style normalized pulse-envelope width."""
+    right_indices = np.where(power[peak_index:] < limit)[0]
+    left_indices = np.where(power[:peak_index] < limit)[0]
+    if right_indices.size == 0 or left_indices.size == 0:
+        return None
+
+    right = peak_index + right_indices[0] - 1
+    left = left_indices[-1] + 1
+    x_left = left + (limit - power[left]) / (power[left + 1] - power[left])
+    x_right = right + (limit - power[right]) / (power[right + 1] - power[right])
+    sample_indices = np.arange(len(range_vector))
+    envelope_start = np.interp(x_left, sample_indices, range_vector)
+    envelope_end = np.interp(x_right, sample_indices, range_vector)
+    normalized_width = (envelope_end - envelope_start) / (sound_speed * pulse_duration / 2)
+    return normalized_width, left, right, envelope_start, envelope_end
+
+
+def _detect_single_target_candidates(d_sp, cal, along, athwart, ping, params):
+    """Return Method 2 single-target candidates for one ping."""
+    abs_coeff = _scalar_at(cal.absorption_coefficient, ping)
+    range_vector = d_sp.range
+    compensated_range_term = 40 * np.log10(range_vector) + 2 * abs_coeff * range_vector
+    calibrated_power = d_sp.data[ping] - compensated_range_term
+    maxima = argrelextrema(calibrated_power, np.greater)[0]
+    sound_speed = _scalar_at(cal.sound_speed, ping)
+    pulse_duration = _scalar_at(cal.pulse_duration, ping)
+    pulse_term = sound_speed * pulse_duration / 4
+    candidates = []
+
+    minimum_threshold = params.min_threshold if hasattr(params, 'min_threshold') else params.threshold_min
+    maximum_threshold = params.max_threshold if hasattr(params, 'max_threshold') else params.threshold_max
+
+    for peak_index in maxima:
+        pldl_value = calibrated_power[peak_index] - params.PLDL
+        result = _calculate_pulse_width(
+            calibrated_power,
+            peak_index,
+            pldl_value,
+            range_vector,
+            sound_speed,
+            pulse_duration,
+        )
+        if result is None:
+            continue
+
+        normalized_width, left, right, envelope_start, envelope_end = result
+        if normalized_width > params.maxNormPulseLen or normalized_width < params.minNormPulseLen:
+            continue
+
+        peak_along = along.data[ping][peak_index]
+        peak_athwart = athwart.data[ping][peak_index]
+        along_norm = 2 * peak_along / cal.beam_width_alongship[ping]
+        athwart_norm = 2 * peak_athwart / cal.beam_width_athwartship[ping]
+        beam_compensation = 6.0206 * (
+            along_norm ** 2
+            + athwart_norm ** 2
+            - (0.18 * along_norm ** 2 * athwart_norm ** 2)
+        )
+        if beam_compensation > params.maxBeamComp:
+            continue
+
+        start_index = left + 1
+        end_index = right - 1
+        if (end_index - start_index) < 1:
+            continue
+        if np.std(along.data[ping][start_index:end_index]) > params.maxSDalong:
+            continue
+        if np.std(athwart.data[ping][start_index:end_index]) > params.maxSDathwart:
+            continue
+
+        envelope_power = 10 ** (calibrated_power[left:right + 1] / 10)
+        target_range = (
+            np.sum(range_vector[left:right + 1] * envelope_power)
+            / np.sum(envelope_power)
+            - pulse_term
+        )
+        if not np.isfinite(target_range) or target_range <= 0:
+            continue
+        if target_range > params.excludeBelow or target_range < params.excludeAbove:
+            continue
+
+        uncompensated_ts = (
+            calibrated_power[peak_index]
+            + 40 * np.log10(target_range)
+            + 2 * abs_coeff * target_range
+        )
+        compensated_ts = uncompensated_ts + beam_compensation
+        if not minimum_threshold <= compensated_ts <= maximum_threshold:
+            continue
+
+        candidates.append({
+            'r': target_range,
+            'uTS': uncompensated_ts,
+            'cTS': compensated_ts,
+            'peakAthwart': peak_athwart,
+            'peakAlong': peak_along,
+            'sdAlng': np.std(along.data[ping][start_index:end_index]),
+            'sdAthw': np.std(athwart.data[ping][start_index:end_index]),
+            'normWidth': normalized_width,
+            'envelope_start': envelope_start - pulse_term,
+            'envelope_end': envelope_end - pulse_term,
+        })
+
+    return _reject_overlapping_candidates(candidates)
 
 class singleTargetsInit():
     """Container for detected single target attributes with subsetting capability."""
@@ -684,13 +821,6 @@ class EchosounderCalibration:
         self._load_bad_data_regions()
 
     def get_reference_ts(self):
-        tsbw = {14000:{512:1750,1024:1570}, 18000:{512:1750,1024:1570}, 22000:{512:1750,1024:1570},
-                35000:{512:3280,1024:2430}, 38000:{512:3280,1024:2430}, 44000:{512:3280,1024:2430}, 
-                57000:{512:4630,1024:2830}, 70000:{512:4630,1024:2830}, 82000:{512:4630,1024:2830},
-                98000:{512:5490,1024:2990}, 120000:{512:5490,1024:2990}, 148000:{512:5490,1024:2990}, 
-                169000:{512:590,1024:3050}, 200000:{512:590,1024:3050}, 230000:{512:590,1024:3050},
-                395000:{512:590,1024:3050}, 338000:{512:590,1024:3050}, 440000:{512:590,1024:3050}}
-        
         if self.env_settings.get('manual_env', False):
             print("  > Using manual environment values.")
             temp = self.env_settings['manual_temp']
@@ -703,6 +833,11 @@ class EchosounderCalibration:
                 lon=0.0,
                 lat=self.lat,
             )
+            print(np.array([sal]),
+                            np.array([temp]),
+                            np.array([self.sphere_range]),
+                            lon=0.0,
+                            lat=self.lat)
         else:
             print("  > Using CTD file for environment values.")
             if not self.ctd_file or not os.path.exists(self.ctd_file):
@@ -739,6 +874,11 @@ class EchosounderCalibration:
                     lat=self.lat,
                 )
                 sound_speed = 1 / np.mean(1 / path_c)
+            print(path_df['sal'].values,
+                                path_df['temp'].values,
+                                path_df['pressure'].values,
+                                self.lat,
+                                sound_speed)
 
         material = tsCalc.material_properties()[self.sphere_mat]
 
@@ -749,9 +889,11 @@ class EchosounderCalibration:
                 f"while calibration object value is {cal_sound_speed:.1f} m/s."
             )
         
-        f = int(self.cal.frequency)
-        pl = int(np.round(self.cal.pulse_duration * 1e6))
-        bw = tsbw[f][pl]
+        f = _scalar_at(self.cal.frequency)
+        pulse_duration = _scalar_at(self.cal.pulse_duration)
+        if pulse_duration <= 0:
+            raise ValueError(f"Pulse duration must be positive, got {pulse_duration} s.")
+        bw = 1 / pulse_duration
         
         fr, ts = tsCalc.freq_response(f-bw/2, f+bw/2, self.sphere_size/1000/2, sound_speed, 
                                       material['c1'], material['c2'], rho, material['rho1'], fstep=100)
@@ -759,46 +901,21 @@ class EchosounderCalibration:
 
     def detect_targets(self):
         ping_times_dt = pd.to_datetime(self.d_sp.ping_time)
+        self.targets = singleTargetsInit()
 
         for ping in range(self.d_sp.n_pings):
             ping_time = ping_times_dt[ping]
             if any(start_time <= ping_time <= end_time for start_time, end_time in self.bad_data_regions):
                 continue
+            for candidate in _detect_single_target_candidates(
+                self.d_sp, self.cal, self.along, self.athwart, ping, self.params,
+            ):
+                self._append_target(
+                    ping, candidate['r'], candidate['uTS'], candidate['cTS'],
+                    candidate['peakAthwart'], candidate['peakAlong'], candidate['normWidth'],
+                )
 
-            abs_coeff = self.cal.absorption_coefficient[ping]
-            cpv = 40 * np.log10(self.d_sp.range) + 2 * abs_coeff * self.d_sp.range
-            calPower = self.d_sp.data[ping] - cpv
-            maxima = argrelextrema(calPower, np.greater)[0]
-
-            for l in maxima:
-                pldl_val = calPower[l] - self.params.PLDL
-                res = self._calculate_pulse_width(calPower, l, pldl_val)
-                if res is None: continue
-                normWidth, left, right = res
-
-                if (normWidth > self.params.maxNormPulseLen) or (normWidth < self.params.minNormPulseLen):
-                    continue
-
-                peak_along = self.along.data[ping][l]
-                peak_athwart = self.athwart.data[ping][l]
-                beam_comp = self._get_beam_comp(ping, peak_along, peak_athwart)
-
-                if beam_comp > self.params.maxBeamComp:
-                    continue
-
-                if not self._check_stdev(ping, left + 1, right - 1):
-                    continue
-
-                r_val = (sum(self.d_sp.range[left+1:right-1] * calPower[left+1:right-1])) / \
-                        sum(calPower[left+1:right-1]) - (self.cal.sound_speed * self.cal.pulse_duration) / 4
-                
-                uTS = calPower[l] + (40 * np.log10(r_val)) + (2 * abs_coeff * r_val)
-                cTS = uTS + beam_comp
-
-                if self.params.min_threshold <= cTS <= self.params.max_threshold:
-                    self._append_target(ping, r_val, uTS, cTS, peak_athwart, peak_along, normWidth)
-
-    def _calculate_pulse_width(self, power, l, limit):
+    def _calculate_pulse_width(self, power, l, limit, range_vector, sound_speed, pulse_duration):
         r_idx = np.where(power[l:] < limit)[0]
         l_idx = np.where(power[:l] < limit)[0]
         if r_idx.size == 0 or l_idx.size == 0: return None
@@ -806,7 +923,11 @@ class EchosounderCalibration:
         right, left = l + r_idx[0] - 1, l_idx[-1] + 1
         xLeft = left + (limit - power[left]) / (power[left+1] - power[left])
         xRight = right + (limit - power[right]) / (power[right+1] - power[right])
-        return (xRight - xLeft) / 4, left, right
+        sample_indices = np.arange(len(range_vector))
+        envelope_start = np.interp(xLeft, sample_indices, range_vector)
+        envelope_end = np.interp(xRight, sample_indices, range_vector)
+        normalized_width = (envelope_end - envelope_start) / (sound_speed * pulse_duration / 2)
+        return normalized_width, left, right, envelope_start, envelope_end
 
     def _get_beam_comp(self, ping, p_along, p_athwart):
         al = 2 * p_along / self.cal.beam_width_alongship[ping]
@@ -859,17 +980,33 @@ class EchosounderCalibration:
         d_sv_on_axis.delete(index_array=pings_no_sphere)
         d_sv_on_axis.range = self.d_sv.range
 
+        maximum_plot_range = self.sphere_range + 25.0
+        range_indices = np.where(self.d_sv.range <= maximum_plot_range)[0]
+        if range_indices.size > 0:
+            d_sv_on_axis = d_sv_on_axis.view(
+                (0, -1, 1),
+                (0, int(range_indices[-1]), 1),
+            )
+
         observed_ts = 10 * np.log10(np.mean(10**(self.sphere_targets.cTS / 10)))
         observed_ts_std = np.std(self.sphere_targets.cTS)
         mean_range = np.mean(self.sphere_targets.r)
 
         if plot:
             clean_id = self.channel_id.replace(' ', '_').replace('-', '_').replace(':', '_')+'-'+str(self.sphere_size).split('.')[0]
-            fig, ax = plt.subplots(1, 2, figsize=(10, 5))
+            fig, ax = plt.subplots(1, 3, figsize=(15, 5))
+            fig.suptitle(self.channel_id)
             ax[0].hist(self.sphere_targets.cTS, bins=100)
-            ax[0].set_title(f"TS Distribution: {self.channel_id}")
+            ax[0].set_title(f"TS Distribution (N={len(self.sphere_targets.cTS)})")
             ax[1].plot(self.sphere_targets.peakAlong, self.sphere_targets.peakAthwart, '.')
             ax[1].set_title(f"Beam Positions: {self.channel_id}")
+            ax[2].plot(self.sphere_targets.ping, self.sphere_targets.r, '.')
+            ax[2].set_title("Single Target Range")
+            ax[2].set_xlabel("Single Target Number")
+            ax[2].set_ylabel("Range (m)")
+            ax[2].grid(True)
+            ax[2].invert_yaxis()
+            fig.tight_layout(rect=(0, 0, 1, 0.95))
             if plot_save_dir:
                 plt.savefig(os.path.join(plot_save_dir, f"{clean_id}_stats.png"))
             plt.close(fig)
@@ -911,9 +1048,9 @@ class EchosounderCalibration:
             'observed_nasc': obs_nasc,
             'reference_nasc': ref_nasc,
             'ping_count': len(d_sv_on_axis.ping_time),
-            'new_sv_gain': new_sv_gain,
             'calc_ts_gain': calc_gain,
             'sa_correction': sa_corr,
+            'new_sv_gain': new_sv_gain,
             'files_used': ", ".join(self.raw_files)
         }
 
@@ -1195,23 +1332,8 @@ class AVOCalibrationSession:
         )
 
     def get_reference_ts(self):
-        tsbw = {
-            18000: {512: 1750, 1024: 1570},
-            38000: {512: 3280, 1024: 2430},
-            70000: {512: 4630, 1024: 2830},
-            120000: {512: 5490, 1024: 2990},
-            200000: {512: 590, 1024: 3050},
-            333000: {512: 590, 1024: 3050},
-            338000: {512: 590, 1024: 3050},
-        }
-
         if hasattr(self.channel_data, "is_cw") and not self.channel_data.is_cw():
             raise ValueError("AVO mode only supports CW data.")
-
-        if self.frequency not in tsbw or self.pulse_length_us not in tsbw[self.frequency]:
-            raise ValueError(
-                f"Unsupported frequency/pulse combination for AVO mode: {self.frequency} Hz, {self.pulse_length_us} us."
-            )
 
         material = tsCalc.material_properties()[self.settings["sphere_material"]]
         sound_speed, density = tsCalc.water_properties(
@@ -1221,7 +1343,10 @@ class AVOCalibrationSession:
             lon=0.0,
             lat=self.lat,
         )
-        bandwidth = tsbw[self.frequency][self.pulse_length_us]
+        pulse_duration = self._first_scalar(self.cal.pulse_duration)
+        if pulse_duration <= 0:
+            raise ValueError(f"Pulse duration must be positive, got {pulse_duration} s.")
+        bandwidth = 1 / pulse_duration
         _, ts = tsCalc.freq_response(
             self.frequency - bandwidth / 2,
             self.frequency + bandwidth / 2,
@@ -1236,90 +1361,30 @@ class AVOCalibrationSession:
         return 10 * np.log10(np.mean(10 ** (ts / 10)))
 
     def detect_targets(self):
+        self.targets = AVOSingleTargets()
         for ping in range(self.d_sp.n_pings):
-            cpv = 40 * np.log10(self.d_sp.range) + 2 * self.cal.absorption_coefficient[ping] * self.d_sp.range
-            cal_power = self.d_sp.data[ping] - cpv
-            maxima = argrelextrema(cal_power, np.greater)[0]
-            pulse_term = (self._first_scalar(self.cal.sound_speed) * self._first_scalar(self.cal.pulse_duration)) / 4
-
-            for peak_index in maxima:
-                pldl_val = cal_power[peak_index] - self.params.PLDL
-                if np.where(cal_power[peak_index:] < pldl_val)[0].size > 0:
-                    right = peak_index + np.where(cal_power[peak_index:] < pldl_val)[0][0] - 1
-                else:
-                    continue
-
-                if np.where(cal_power[:peak_index] < pldl_val)[0].size > 0:
-                    left = np.where(cal_power[:peak_index] < pldl_val)[0][-1] + 1
-                else:
-                    continue
-
-                x_left = left + (pldl_val - cal_power[left]) / (cal_power[left + 1] - cal_power[left])
-                x_right = right + (pldl_val - cal_power[right]) / (cal_power[right + 1] - cal_power[right])
-                norm_width = (x_right - x_left) / 4
-                if norm_width > self.params.maxNormPulseLen or norm_width < self.params.minNormPulseLen:
-                    continue
-
-                start_index = left + 1
-                end_index = right - 1
-                if (end_index - start_index) < 1:
-                    continue
-
-                peak_along_deg = self.along.data[ping][peak_index]
-                peak_athwart_deg = self.athwart.data[ping][peak_index]
-                along_norm = 2 * peak_along_deg / self.cal.beam_width_alongship[ping]
-                athwart_norm = 2 * peak_athwart_deg / self.cal.beam_width_athwartship[ping]
-                beam_comp = 6.0206 * (
-                    along_norm ** 2 + athwart_norm ** 2 - (0.18 * along_norm ** 2 * athwart_norm ** 2)
-                )
-
-                if beam_comp > self.params.maxBeamComp:
-                    continue
-
-                along_target = self.along.data[ping][start_index:end_index]
-                athwart_target = self.athwart.data[ping][start_index:end_index]
-                sd_along = np.std(along_target)
-                sd_athwart = np.std(athwart_target)
-                if sd_along > self.params.maxSDalong or sd_athwart > self.params.maxSDathwart:
-                    continue
-
-                r_val = (
-                    sum(self.d_sp.range[start_index:end_index] * cal_power[start_index:end_index])
-                    / sum(cal_power[start_index:end_index])
-                    - pulse_term
-                )
-                if r_val > self.params.excludeBelow or r_val < self.params.excludeAbove:
-                    continue
-
-                u_ts = cal_power[peak_index] + (40 * np.log10(r_val)) + (2 * self.cal.absorption_coefficient[ping] * r_val)
-                c_ts = u_ts + beam_comp
-                if c_ts < self.params.threshold_min or c_ts > self.params.threshold_max:
-                    continue
-
+            for candidate in _detect_single_target_candidates(
+                self.d_sp, self.cal, self.along, self.athwart, ping, self.params,
+            ):
                 self.targets.ping = np.append(self.targets.ping, ping)
-                self.targets.r = np.append(self.targets.r, r_val)
-                self.targets.uTS = np.append(self.targets.uTS, u_ts)
-                self.targets.cTS = np.append(self.targets.cTS, c_ts)
-                self.targets.peakAthwart = np.append(self.targets.peakAthwart, peak_athwart_deg)
-                self.targets.peakAlong = np.append(self.targets.peakAlong, peak_along_deg)
-                self.targets.sdAlng = np.append(self.targets.sdAlng, sd_along)
-                self.targets.sdAthw = np.append(self.targets.sdAthw, sd_athwart)
-                self.targets.normWidth = np.append(self.targets.normWidth, norm_width)
+                self.targets.r = np.append(self.targets.r, candidate['r'])
+                self.targets.uTS = np.append(self.targets.uTS, candidate['uTS'])
+                self.targets.cTS = np.append(self.targets.cTS, candidate['cTS'])
+                self.targets.peakAthwart = np.append(self.targets.peakAthwart, candidate['peakAthwart'])
+                self.targets.peakAlong = np.append(self.targets.peakAlong, candidate['peakAlong'])
+                self.targets.sdAlng = np.append(self.targets.sdAlng, candidate['sdAlng'])
+                self.targets.sdAthw = np.append(self.targets.sdAthw, candidate['sdAthw'])
+                self.targets.normWidth = np.append(self.targets.normWidth, candidate['normWidth'])
 
     def save_echograms(self):
-        calview_depth = {
-            18000: 2000,
-            38000: 2000,
-            70000: 2700,
-            120000: 5000,
-            200000: 8000,
-            333000: 8000,
-            338000: 8000,
-        }
         clean_id = self._safe_filename()
         vessel = self.settings["vessel"]
 
-        full_indices = np.where(self.d_sv.depth <= calview_depth.get(self.frequency, self.d_sv.depth[-1]))[0]
+        # Keep the saved echogram focused on the calibration area.  The sphere
+        # depth includes the transducer depth, so this is 25 m beyond the
+        # configured sphere range in the echogram's depth coordinates.
+        maximum_plot_depth = self.sphere_depth + 25.0
+        full_indices = np.where(self.d_sv.depth <= maximum_plot_depth)[0]
         if full_indices.size > 0:
             d_sv_full = self.d_sv.view((0, -1, 1), (0, int(full_indices[-1]), 1))
         else:
@@ -1601,6 +1666,7 @@ class QuickCalGUI:
         self.avo_settings = get_default_avo_settings()
         self.mode_label_var = tk.StringVar(value="Mode: QuickCal")
         self.quickcal_only_widgets = []
+        self.calibration_running = False
 
         # Variables for Global Settings
         self.output_dir = tk.StringVar()
@@ -1615,6 +1681,7 @@ class QuickCalGUI:
         self.manual_temp = tk.DoubleVar(value=10.0)
         self.manual_sal = tk.DoubleVar(value=35.0)
         self.manual_c = tk.DoubleVar(value=1500.0)
+        self.transducer_depth = tk.DoubleVar(value=9.15)
         
         # Detection Parameters
         self.det_PLDL = tk.DoubleVar(value=6)
@@ -1647,22 +1714,37 @@ class QuickCalGUI:
         )
         bad_data_button.pack(side=tk.RIGHT, padx=5)
         self.quickcal_only_widgets.append(bad_data_button)
-        ttk.Button(top_frame, text="RUN CALIBRATION", command=self.run_calibration_thread).pack(side=tk.RIGHT, padx=5)
+        self.run_button = ttk.Button(
+            top_frame,
+            text="RUN CALIBRATION",
+            command=self.run_calibration_thread,
+        )
+        self.run_button.pack(side=tk.RIGHT, padx=5)
 
         # Main Scrollable Area
-        main_canvas = tk.Canvas(self.root)
-        scrollbar = ttk.Scrollbar(self.root, orient="vertical", command=main_canvas.yview)
+        main_scroll_container = ttk.Frame(self.root)
+        main_scroll_container.pack(fill="both", expand=True)
+        main_scroll_container.grid_rowconfigure(0, weight=1)
+        main_scroll_container.grid_columnconfigure(0, weight=1)
+
+        main_canvas = tk.Canvas(main_scroll_container)
+        scrollbar = ttk.Scrollbar(main_scroll_container, orient="vertical", command=main_canvas.yview)
         scrollable_frame = ttk.Frame(main_canvas)
 
         scrollable_frame.bind(
             "<Configure>",
             lambda e: main_canvas.configure(scrollregion=main_canvas.bbox("all"))
         )
-        main_canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        scrollable_window = main_canvas.create_window(
+            (0, 0), window=scrollable_frame, anchor="nw"
+        )
+        main_canvas.bind(
+            "<Configure>",
+            lambda e: main_canvas.itemconfigure(scrollable_window, width=e.width)
+        )
         main_canvas.configure(yscrollcommand=scrollbar.set)
-        
-        main_canvas.pack(side="top", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        main_canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
 
         # --- Section 1: Global Definitions ---
         f1 = ttk.LabelFrame(scrollable_frame, text="Global Definitions", padding="10")
@@ -1753,8 +1835,8 @@ class QuickCalGUI:
 
         
         # --- Section 4: Console Output ---
-        f4 = ttk.LabelFrame(self.root, text="Console Output", padding="5")
-        f4.pack(side="bottom", fill="both", expand=True, padx=10, pady=5)
+        f4 = ttk.LabelFrame(scrollable_frame, text="Console Output", padding="5")
+        f4.pack(fill="both", expand=True, padx=10, pady=5)
         
         self.console = scrolledtext.ScrolledText(f4, height=10, state="disabled")
         self.console.pack(fill="both", expand=True)
@@ -1796,13 +1878,20 @@ class QuickCalGUI:
 
         depth_frame = ttk.Frame(calc_frame)
         depth_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(depth_frame, text="End Depth (m):").pack(side=tk.LEFT)
+        ttk.Label(depth_frame, text="Transducer Depth (m):").pack(side=tk.LEFT)
+        ttk.Entry(depth_frame, textvariable=self.transducer_depth, width=10).pack(side=tk.LEFT, padx=5)
+
+        end_depth_frame = ttk.Frame(calc_frame)
+        end_depth_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(end_depth_frame, text="End Depth (m):").pack(side=tk.LEFT)
         end_depth_var = tk.DoubleVar(value=50.0)
-        ttk.Entry(depth_frame, textvariable=end_depth_var, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Entry(end_depth_frame, textvariable=end_depth_var, width=10).pack(side=tk.LEFT, padx=5)
         ttk.Button(
             calc_frame,
             text="Calculate",
-            command=lambda: self.calculate_ctd_averages(end_depth_var.get()),
+            command=lambda: self.calculate_ctd_averages(
+                end_depth_var.get(), self.transducer_depth.get()
+            ),
         ).pack(pady=5)
 
         manual_grid = ttk.Frame(manual_frame)
@@ -1824,26 +1913,36 @@ class QuickCalGUI:
         ttk.Button(env_popup, text="Save and Close", command=save_and_close).pack(pady=10)
         toggle_mode()
 
-    def calculate_ctd_averages(self, end_depth):
+    def calculate_ctd_averages(self, end_depth, transducer_depth=None):
         ctd_path = self.ctd_file.get()
         if not ctd_path or not os.path.exists(ctd_path):
             messagebox.showerror("Error", "Please select a valid CTD file first.")
             return
 
         try:
+            if transducer_depth is None:
+                transducer_depth = self.transducer_depth.get()
+            if transducer_depth >= end_depth:
+                messagebox.showwarning(
+                    "Warning",
+                    "Transducer depth must be less than the end depth.",
+                )
+                return
+
             ctd_df = read_ctd_file(ctd_path)
-            mask = (ctd_df['depth'] >= 9.15) & (ctd_df['depth'] <= end_depth)
+            mask = (ctd_df['depth'] >= transducer_depth) & (ctd_df['depth'] <= end_depth)
             if not mask.any():
                 messagebox.showwarning(
                     "Warning",
-                    f"No CTD data found in the specified depth range (9.15m to {end_depth}m)",
+                    f"No CTD data found in the specified depth range "
+                    f"({transducer_depth}m to {end_depth}m)",
                 )
                 return
 
             avg_df = ctd_df[mask]
             avg_temp = avg_df['temp'].mean()
             avg_sal = avg_df['sal'].mean()
-            mid_depth = (9.15 + end_depth) / 2
+            mid_depth = (transducer_depth + end_depth) / 2
             sound_speed, _ = tsCalc.water_properties(
                 np.array([avg_sal]),
                 np.array([avg_temp]),
@@ -1855,7 +1954,7 @@ class QuickCalGUI:
             messagebox.showinfo(
                 "CTD Calculation Results",
                 (
-                    f"Average values from 9.15m to {end_depth}m:\n"
+                    f"Average values from {transducer_depth}m to {end_depth}m:\n"
                     f"  - Temperature: {avg_temp:.3f} °C\n"
                     f"  - Salinity: {avg_sal:.3f} PSU\n"
                     f"  - Sound Speed: {sound_speed.item():.3f} m/s"
@@ -2217,6 +2316,13 @@ class QuickCalGUI:
             'default_sphere_material': self.sphere_mat.get(),
             'sphere_range_tolerance': self.range_tol.get(),
             'sphere_ts_tolerance': self.ts_tol.get(),
+            'environment_settings': {
+                'manual_env': self.manual_env.get(),
+                'manual_temp': self.manual_temp.get(),
+                'manual_sal': self.manual_sal.get(),
+                'manual_c': self.manual_c.get(),
+                'transducer_depth': self.transducer_depth.get(),
+            },
             'detection_parameters': {
                 'PLDL': self.det_PLDL.get(),
                 'maxNormPulseLen': self.det_maxNormPulseLen.get(),
@@ -2258,6 +2364,7 @@ class QuickCalGUI:
             self.manual_temp.set(env.get('manual_temp', 10.0))
             self.manual_sal.set(env.get('manual_sal', 35.0))
             self.manual_c.set(env.get('manual_c', 1500.0))
+            self.transducer_depth.set(env.get('transducer_depth', 9.15))
 
             self.sphere_size.set(config.get('default_sphere_size', 38.1))
             self.sphere_mat.set(config.get('default_sphere_material', 'Tungsten carbide'))
@@ -2295,6 +2402,9 @@ class QuickCalGUI:
             messagebox.showerror("Save Error", str(e))
 
     def run_calibration_thread(self):
+        if self.calibration_running:
+            return
+
         # Save temp config first
         config = self.generate_config_dict()
         if not config['channels']:
@@ -2304,6 +2414,9 @@ class QuickCalGUI:
         temp_path = os.path.join(os.getcwd(), "_gui_temp_config_ev_avo.yaml")
         with open(temp_path, 'w') as f:
             yaml.safe_dump(config, f, sort_keys=False, default_flow_style=False)
+
+        self.calibration_running = True
+        self.run_button.configure(state="disabled")
             
         # Run in thread to keep GUI responsive
         t = threading.Thread(target=self.run_logic, args=(temp_path,))
@@ -2332,6 +2445,13 @@ class QuickCalGUI:
                     os.remove(config_path)
                 except:
                     pass
+
+            self.root.after(0, self._calibration_finished)
+
+    def _calibration_finished(self):
+        """Re-enable calibration controls on Tk's main thread."""
+        self.calibration_running = False
+        self.run_button.configure(state="normal")
 
 if __name__ == "__main__":
     root = tk.Tk()

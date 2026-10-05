@@ -1,1 +1,4 @@
 QuickCal/__pycache__/
+QuickCal/.vscode/
+QuickCal/CalCompare/
+*.ipynb
