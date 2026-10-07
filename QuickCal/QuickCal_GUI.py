@@ -28,9 +28,14 @@ from scipy.signal import argrelextrema
 try:
     import tsCalc
     import win32com.client
-    from MaceFunctions.echolab2.instruments import echosounder
-    from MaceFunctions.echolab2.plotting.matplotlib import echogram
-    from MaceFunctions.echolab2.processing import line, grid, integration
+    try:
+        from MaceFunctions.echolab2.instruments import echosounder
+        from MaceFunctions.echolab2.plotting.matplotlib import echogram
+        from MaceFunctions.echolab2.processing import line, grid, integration
+    except ImportError:
+        from echolab2.instruments import echosounder
+        from echolab2.plotting.matplotlib import echogram
+        from echolab2.processing import line, grid, integration
     from matplotlib.pyplot import figure, show
 except ImportError as e:
     print(f"Warning: Critical dependencies missing ({e}). GUI will load but calibration will fail.")
@@ -498,6 +503,14 @@ def format_saved_config_yaml(config):
             "### Output definitions ###",
             "",
         ])
+        if config.get("raw_input_directory"):
+            _append_commented_scalar(
+                lines,
+                "raw_input_directory",
+                config.get("raw_input_directory", ""),
+                "Base folder containing raw data files. Channels can specify file basenames.",
+            )
+            lines.append("")
         _append_commented_scalar(
             lines,
             "output_directory",
@@ -553,6 +566,14 @@ def format_saved_config_yaml(config):
         "### Global definitions ###",
         "",
     ]
+    if config.get("raw_input_directory"):
+        _append_commented_scalar(
+            lines,
+            "raw_input_directory",
+            config.get("raw_input_directory", ""),
+            "Base folder containing raw data files. Channels can specify file basenames.",
+        )
+        lines.append("")
     _append_commented_scalar(
         lines,
         "output_directory",
@@ -628,17 +649,22 @@ def format_saved_config_yaml(config):
     return "\n".join(lines) + "\n"
 
 
-def expand_raw_files(files):
+def expand_raw_files(files, input_dir=None):
     if not isinstance(files, list):
         files = [files]
 
     expanded_files = []
     for file_path in files:
-        matches = glob(file_path)
-        if matches:
-            expanded_files.extend(matches)
+        if input_dir and not os.path.isabs(file_path):
+            target_path = os.path.join(input_dir, file_path)
         else:
-            expanded_files.append(file_path)
+            target_path = file_path
+
+        matches = glob(target_path)
+        if matches:
+            expanded_files.extend([m.replace('\\', '/') for m in matches])
+        else:
+            expanded_files.append(target_path.replace('\\', '/'))
 
     return sorted(list(set(expanded_files)))
 
@@ -958,9 +984,11 @@ class EchosounderCalibration:
         sphere_mat='Tungsten carbide',
         sphere_range=21.0,
         detect_config=None,
+        raw_input_directory=None,
     ):
         self.channel_id = channel_id
-        self.raw_files = self._build_file_list(raw_files)
+        self.raw_input_directory = raw_input_directory
+        self.raw_files = self._build_file_list(raw_files, raw_input_directory=raw_input_directory)
         self.ctd_file = ctd_file
         self.env_settings = env_settings or {}
         self.bad_data_regions_file = bad_data_regions_file
@@ -1079,9 +1107,9 @@ class EchosounderCalibration:
             import traceback
             traceback.print_exc()
 
-    def _build_file_list(self, files):
+    def _build_file_list(self, files, raw_input_directory=None):
         """Expands wildcards and ensures a sorted list of unique files."""
-        return expand_raw_files(files)
+        return expand_raw_files(files, input_dir=raw_input_directory)
 
     def load_data(self):
         """Reads raw data and extracts calibration/angle information."""
@@ -1302,9 +1330,26 @@ class EchosounderCalibration:
         calc_gain = (((observed_ts - ref_ts) / 2) + np.unique(self.cal.gain))[0]
         sa_corr = new_sv_gain - calc_gain
 
+        on_axis_start_time = (
+            str(pd.to_datetime(d_sv_on_axis.ping_time[0]))
+            if len(d_sv_on_axis.ping_time) > 0
+            else None
+        )
+        on_axis_end_time = (
+            str(pd.to_datetime(d_sv_on_axis.ping_time[-1]))
+            if len(d_sv_on_axis.ping_time) > 0
+            else None
+        )
+
         return {
+            'frequency': round(_scalar_at(self.cal.frequency) / 1000.0, 3),
             'channel_id': self.channel_id,
-            'sphere_size':self.sphere_size,
+            'on_axis_start_time': on_axis_start_time,
+            'on_axis_end_time': on_axis_end_time,
+            'sphere_size': self.sphere_size,
+            'pulse_duration': round(_scalar_at(self.cal.pulse_duration) * 1000.0, 4),
+            'sound_speed_ts': float(self.sound_speed),
+            'absorption_coefficient': float(_scalar_at(self.cal.absorption_coefficient)),
             'observed_ts': observed_ts,
             'observed_ts_std': observed_ts_std,
             'reference_ts': ref_ts,
@@ -1336,6 +1381,7 @@ def run_batch_calibration(config_path, do_plot=True):
     os.makedirs(plots_dir, exist_ok=True)
     
     global_ctd = config.get('default_ctd')
+    raw_input_dir = config.get('raw_input_directory')
     env_settings = config.get('environment_settings', {})
     global_sphere = config.get('default_sphere_size', 38.1)
     global_sphere_mat = config.get('default_sphere_material', 'Tungsten carbide')
@@ -1366,7 +1412,8 @@ def run_batch_calibration(config_path, do_plot=True):
                     sphere_range=ch_conf['sphere_range'],
                     sphere_size=ch_conf.get('sphere_size', global_sphere),
                     sphere_mat=ch_conf.get('sphere_material', global_sphere_mat),
-                    detect_config=ch_detect
+                    detect_config=ch_detect,
+                    raw_input_directory=raw_input_dir
                 )
                 cal_session.load_data()
                 res = cal_session.run_calibration(
@@ -1516,9 +1563,10 @@ class TriwaveCorrect:
 
 
 class AVOCalibrationSession:
-    def __init__(self, channel_id, raw_files, sphere_range, settings, output_dir, ctd_file=None, transducer_depth=9.15):
+    def __init__(self, channel_id, raw_files, sphere_range, settings, output_dir, ctd_file=None, transducer_depth=9.15, raw_input_directory=None):
         self.channel_id = channel_id
-        self.raw_files = expand_raw_files(raw_files)
+        self.raw_input_directory = raw_input_directory
+        self.raw_files = expand_raw_files(raw_files, input_dir=raw_input_directory)
         self.sphere_range = float(sphere_range)
         self.settings = merge_avo_settings(settings)
         self.ctd_file = ctd_file
@@ -1904,6 +1952,7 @@ def run_avo_batch_calibration(config_path, do_plot=True):
     os.makedirs(base_dir, exist_ok=True)
 
     avo_settings = merge_avo_settings(config.get("avo_settings", {}))
+    raw_input_dir = config.get("raw_input_directory")
     ctd_file = config.get("default_ctd")
     environment_settings = config.get("environment_settings", {})
     transducer_depth = environment_settings.get("transducer_depth", 9.15)
@@ -1925,6 +1974,7 @@ def run_avo_batch_calibration(config_path, do_plot=True):
                 output_dir=base_dir,
                 ctd_file=channel.get("ctd_file", ctd_file),
                 transducer_depth=transducer_depth,
+                raw_input_directory=raw_input_dir,
             )
             all_results.append(session.run_check(do_plot=do_plot))
         except Exception as exc:
@@ -1985,6 +2035,7 @@ class QuickCalGUI:
         self.range_tol = tk.DoubleVar(value=2.0)
         self.ts_tol = tk.DoubleVar(value=1.0)
         self.bad_data_regions_file = tk.StringVar()
+        self.raw_input_directory = ""
 
         self.manual_env = tk.BooleanVar(value=False)
         self.manual_temp = tk.DoubleVar(value=10.0)
@@ -2532,14 +2583,21 @@ class QuickCalGUI:
             lst.insert(tk.END, os.path.basename(f))
         
         def add_files():
-            fs = filedialog.askopenfilenames(
-                filetypes=[("Raw Files", "*.raw"), ("All Files", "*.*")],
-                parent=popup,
-            )
+            initialdir = None
+            if getattr(self, "raw_input_directory", None) and os.path.isdir(self.raw_input_directory):
+                initialdir = self.raw_input_directory
+            filedialog_kwargs = {
+                "filetypes": [("Raw Files", "*.raw"), ("All Files", "*.*")],
+                "parent": popup,
+            }
+            if initialdir:
+                filedialog_kwargs["initialdir"] = initialdir
+            fs = filedialog.askopenfilenames(**filedialog_kwargs)
             for f in fs:
-                if f not in files_list:
-                    files_list.append(f)
-                    lst.insert(tk.END, os.path.basename(f))
+                f_norm = f.replace('\\', '/')
+                if f_norm not in files_list:
+                    files_list.append(f_norm)
+                    lst.insert(tk.END, os.path.basename(f_norm))
         
         def remove_file():
             sel_f = lst.curselection()
@@ -2680,7 +2738,10 @@ class QuickCalGUI:
         progress_dialog.update()
 
         try:
-            self.generate_ev_file(expand_raw_files(all_raw_files), output_path)
+            self.generate_ev_file(
+                expand_raw_files(all_raw_files, input_dir=getattr(self, "raw_input_directory", None)),
+                output_path,
+            )
             progress_dialog.destroy()
             messagebox.showinfo(
                 "Next Steps",
@@ -2770,6 +2831,8 @@ class QuickCalGUI:
                 'avo_settings': copy.deepcopy(self.avo_settings),
                 'channels': self.channels,
             }
+        if getattr(self, "raw_input_directory", None):
+            config['raw_input_directory'] = self.raw_input_directory
         return config
 
     def load_yaml(self):
@@ -2782,6 +2845,7 @@ class QuickCalGUI:
 
             self.calibration_mode = normalize_calibration_mode(config.get('calibration_mode'))
             self.avo_settings = merge_avo_settings(config.get('avo_settings', {}))
+            self.raw_input_directory = str(config.get('raw_input_directory', '') or '').strip()
             
             self.output_dir.set(config.get('output_directory', ''))
             self.ctd_file.set(config.get('default_ctd', ''))
