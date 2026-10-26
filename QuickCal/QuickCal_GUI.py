@@ -23,7 +23,6 @@ import matplotlib.patches as patches
 from scipy import optimize
 from scipy.signal import argrelextrema
 
-
 # Try imports - handle gracefully if running in environment without them for UI testing
 try:
     import tsCalc
@@ -2908,7 +2907,7 @@ class QuickCalGUI:
             messagebox.showwarning("Warning", "No channels defined.")
             return
 
-        temp_path = os.path.join(os.getcwd(), "_gui_temp_config_ev_avo.yaml")
+        temp_path = os.path.join(self.output_dir, "_gui_temp_config_ev_avo.yaml")
         with open(temp_path, 'w') as f:
             yaml.safe_dump(config, f, sort_keys=False, default_flow_style=False)
 
